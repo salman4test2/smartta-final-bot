@@ -1,0 +1,38 @@
+model: gpt-4o-mini
+temperature: 0.2
+history: { max_turns: 200 }
+
+creation_payload_schema:
+  $schema: "http://json-schema.org/draft-07/schema#"
+  type: object
+  required: [name, language, category, components]
+  properties:
+    name: {type: string, pattern: "^[a-z0-9_]{1,64}$"}
+    language: {type: string}
+    category: {type: string, enum: [MARKETING, UTILITY, AUTHENTICATION]}
+    components:
+      type: array
+      minItems: 1
+      items:
+        type: object
+        required: [type]
+        properties:
+          type: {type: string, enum: [HEADER, BODY, FOOTER, BUTTONS]}
+          format: {type: string, enum: [TEXT, IMAGE, VIDEO, DOCUMENT, LOCATION]}
+          text: {type: string}
+          example: {type: [object, array, string, 'null']}
+          buttons:
+            type: array
+            items:
+              type: object
+              required: [type, text]
+              properties:
+                type: {type: string, enum: [QUICK_REPLY, URL, PHONE_NUMBER]}
+                text: {type: string}
+                url: {type: string}
+                phone_number: {type: string}
+                payload: {type: string}
+  additionalProperties: false
+
+lint_rules:
+  buttons: { max_total: 10, max_url: 2, max_phone: 1 }

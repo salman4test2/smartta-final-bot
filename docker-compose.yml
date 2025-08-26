@@ -1,0 +1,19 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: watemp
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/watemp
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      CONFIG_PATH: /app/config/whatsapp.yaml
+    ports: ["8000:8000"]
+    depends_on: [db]
+volumes:
+  pgdata: {}
