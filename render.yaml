@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: whatsapp-template-builder
+    env: python
+    plan: free
+    region: oregon
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11
+      - key: OPENAI_API_KEY
+        sync: false     # set this secret in Render dashboard
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: CONFIG_PATH
+        value: ./config/whatsapp.yaml
+      # For free tier with SQLite (ephemeral):
+      - key: DATABASE_URL
+        value: sqlite+aiosqlite:////tmp/watemp.db
+      # If you later switch to Postgres, replace DATABASE_URL with a Render DB connection string.
