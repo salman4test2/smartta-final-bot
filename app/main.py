@@ -240,6 +240,17 @@ def _fallback_reply_for_state(state: str) -> str:
         return "What should the main message (BODY) say?"
     return "Could you please rephrase what you want to create?"
 
+def _has_extras_components(p: Dict[str, Any]) -> bool:
+    comps = (p or {}).get("components") or []
+    return any(isinstance(c, dict) and c.get("type") in {"HEADER","FOOTER","BUTTONS"} for c in comps)
+
+def _user_declined_extras(msg: str) -> bool:
+    t = (msg or "").lower()
+    return any(phrase in t for phrase in [
+        "skip", "no buttons", "no header", "no footer",
+        "finalize as is", "looks good as is", "no extras"
+    ])
+
 # ---------- Endpoints ----------
 
 @app.get("/health")
@@ -319,6 +330,9 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
     mem_update = out.get("memory") or {}
     if mem_update:
         memory = merge_deep(memory, mem_update)
+        s.memory = memory
+    if _user_declined_extras(safe_message):
+        memory = merge_deep(memory, {"extras_choice": "skip"})
         s.memory = memory
 
     # local helpers
