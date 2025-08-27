@@ -341,19 +341,14 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
                            {"role": "assistant", "content": assistant_text}]
         return new_hist[-max_turns:]
 
-    # 5) Category gate
+    # ------------------- 5) Let the LLM drive category inference -------------------
     category = (candidate.get("category") or memory.get("category") or draft.get("category"))
     if category and not memory.get("category"):
         s.memory = merge_deep(memory, {"category": category})
 
-    if not category:
-        q = ("Hi! Let's create a WhatsApp template. Which type: "
-             "MARKETING (promos), UTILITY (updates), or AUTHENTICATION (OTP)?")
-        s.last_action = "ASK"
-        s.data = {**(s.data or {}), "messages": _append_history(inp.message, q)}
-        await upsert_session(db, s); await db.commit()
-        return ChatResponse(session_id=s.id, reply=q, draft=draft,
-                            missing=["category"], final_creation_payload=None)
+    # If category is still absent, DO NOT inject a server-side category question.
+    # Trust the LLM's reply to either ask one clarifying question or to infer on its own.
+    # We simply continue to the action handling below.
 
     # 6) Non-FINAL → merge sanitized candidate
     if action in {"ASK","DRAFT","UPDATE","CHITCHAT"}:

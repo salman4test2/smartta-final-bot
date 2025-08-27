@@ -1,15 +1,27 @@
 model: gpt-4o-mini
 temperature: 0.2
-history: { max_turns: 200 }
 
+history:
+  max_turns: 200
+  log_llm_io: true   # optional; your code logs regardless, but good to keep
+
+# Used by the prompt/context and any UI hints
+limits:
+  buttons:
+    max_total: 10     # overall hard cap
+    max_visible: 3    # on-card; rest under "See all"
+    max_url: 2
+    max_phone: 1
+
+# Hard schema gate (unchanged, but kept here for completeness)
 creation_payload_schema:
   $schema: "http://json-schema.org/draft-07/schema#"
   type: object
   required: [name, language, category, components]
   properties:
-    name: {type: string, pattern: "^[a-z0-9_]{1,64}$"}
-    language: {type: string}
-    category: {type: string, enum: [MARKETING, UTILITY, AUTHENTICATION]}
+    name: { type: string, pattern: "^[a-z0-9_]{1,64}$" }
+    language: { type: string }  # e.g., en_US, hi_IN
+    category: { type: string, enum: [MARKETING, UTILITY, AUTHENTICATION] }
     components:
       type: array
       minItems: 1
@@ -17,22 +29,64 @@ creation_payload_schema:
         type: object
         required: [type]
         properties:
-          type: {type: string, enum: [HEADER, BODY, FOOTER, BUTTONS]}
-          format: {type: string, enum: [TEXT, IMAGE, VIDEO, DOCUMENT, LOCATION]}
-          text: {type: string}
-          example: {type: [object, array, string, 'null']}
+          type: { type: string, enum: [HEADER, BODY, FOOTER, BUTTONS] }
+          format: { type: string, enum: [TEXT, IMAGE, VIDEO, DOCUMENT, LOCATION] }
+          text: { type: string }
+          example: { type: [object, array, string, 'null'] }
           buttons:
             type: array
             items:
               type: object
               required: [type, text]
               properties:
-                type: {type: string, enum: [QUICK_REPLY, URL, PHONE_NUMBER]}
-                text: {type: string}
-                url: {type: string}
-                phone_number: {type: string}
-                payload: {type: string}
+                type: { type: string, enum: [QUICK_REPLY, URL, PHONE_NUMBER] }
+                text: { type: string }
+                url: { type: string }
+                phone_number: { type: string }
+                payload: { type: string }
   additionalProperties: false
 
+# Soft rules the server linter can enforce (and the LLM can “see” via context)
 lint_rules:
-  buttons: { max_total: 10, max_url: 2, max_phone: 1 }
+  # Lengths (Meta norms)
+  body_max_chars: 1024
+  header_text_max_chars: 60
+  footer_max_chars: 60
+
+  # Placeholder hygiene
+  placeholders:
+    enforce_sequential: true      # {{1}}, {{2}}, ...
+    forbid_adjacent: true         # no "{{1}}{{2}}"
+    forbid_edge_positions: true   # not at very start or end of BODY
+
+  # Button constraints (kept here for validation; mirrors limits.buttons)
+  buttons:
+    max_total: 10
+    max_url: 2
+    max_phone: 1
+
+  # Category-specific constraints
+  category_constraints:
+    AUTHENTICATION:
+      allow_buttons: false
+      allow_media_header: false
+
+  # Basic safety/compliance filters (extend as needed)
+  forbidden_links:
+    - "^https?://wa\\.me/"
+    - "^javascript:"
+    - "^https?://bit\\.ly/"
+    - "^data:"
+
+  # Optional: restrict languages you actually support in UI/backend
+  language_whitelist:
+    - en_US
+    - hi_IN
+    - es_MX
+    - fr_FR
+
+# Optional future knobs (your code won’t rely on these yet, safe to keep)
+naming_policy:
+  auto_snake_case: true
+  max_len: 64
+  reserved_prefixes: []
