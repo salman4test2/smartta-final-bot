@@ -315,7 +315,7 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
 
     # 2) Build LLM inputs + call
     system = build_system_prompt(cfg)
-    context = build_context_block(draft, memory, cfg)
+    context = build_context_block(draft, memory, cfg, msgs)
     safe_message = _sanitize_user_input(inp.message)
     # Track explicit requests so we can block FINAL until they exist
     lower_msg = safe_message.lower()
