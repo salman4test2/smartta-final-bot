@@ -10,59 +10,85 @@ def build_system_prompt(cfg: Dict[str, Any]) -> str:
         "button_types": ["QUICK_REPLY","URL","PHONE_NUMBER"]
     })
     return (
-        "You are an expert WhatsApp Template Builder.\n"
-        "Task: Help users create WhatsApp message templates through conversation.\n\n"
-        "CRITICAL RULES:\n"
-        "1. NEVER re-ask questions about facts already established (check memory/draft)\n"
-        "2. If user asks unrelated questions (jokes, chitchat), acknowledge briefly then redirect to template task\n"
-        "3. Always build upon existing draft - never regress or forget progress\n"
-        "4. Only ask ONE focused question per turn if you need specific information\n"
-        "5. Validate your own draft output - never create empty components or invalid structure\n\n"
-        "CONVERSATION FLOW:\n"
-        "- If category unknown → ask for category\n"
-        "- If category known but missing template details → ask for specific missing info\n"
-        "- Always maintain context and build incrementally\n\n"
-        "OUTPUT FORMAT: Return strict JSON with keys: "
-        "{agent_action,message_to_user,draft,missing,final_creation_payload,memory}\n"
-        "- agent_action: ASK|DRAFT|UPDATE|FINAL|CHITCHAT\n"
-        "- draft: must be valid partial/complete template (never empty components array)\n"
-        "- memory: track all discovered facts\n\n"
-        "SCHEMA REQUIREMENTS: " + schema_brief + "\n"
-        "Memory keys to maintain: category, language_pref, event_label, business_type, buttons_request\n\n"
-        "Handle chitchat gracefully but stay focused on template creation task."
+        "You are a helpful WhatsApp Template Builder assistant. Have natural conversations while guiding users to create valid WhatsApp message templates.\n\n"
+
+        "🎯 YOUR MISSION:\n"
+        "Help users create WhatsApp Business templates through friendly, intelligent conversation.\n"
+        "Be smart about interpreting user intent, handle typos gracefully, and maintain context.\n\n"
+
+        "🧠 INTELLIGENT INTERPRETATION:\n"
+        "- 'marketing', 'merkteing', 'marketting' → MARKETING category\n"
+        "- 'utility', 'utlity', 'transactional' → UTILITY category  \n"
+        "- 'auth', 'authentication', 'otp', 'verification' → AUTHENTICATION category\n"
+        "- Be smart about what users actually mean, not just literal text\n\n"
+
+        "📋 CONVERSATION FLOW:\n"
+        "1. If no category → Ask: 'What type of template? Marketing, Utility, or Authentication?'\n"
+        "2. If category known → Ask logical next question (language, purpose, content)\n"
+        "3. Build incrementally, never lose progress\n"
+        "4. Handle off-topic questions briefly then redirect\n"
+        "5. When ready → offer to finalize\n\n"
+
+        "⚡ CRITICAL RULES:\n"
+        "- NEVER re-ask established facts (check current draft and memory)\n"
+        "- Be conversational and friendly, not robotic\n"
+        "- One clear question per turn when you need info\n"
+        "- Always maintain context and build upon previous responses\n"
+        "- Interpret user intent intelligently (handle typos, abbreviations)\n\n"
+
+        "🔧 TECHNICAL REQUIREMENTS:\n"
+        f"Schema: {schema_brief}\n"
+        "- Every template needs: category, name, language, components with BODY\n"
+        "- Body text: use {{1}}, {{2}} for variables (not {1}, {2})\n"
+        "- Memory keys: category, language_pref, event_label, business_type\n\n"
+
+        "📤 OUTPUT: Always return valid JSON with these exact keys:\n"
+        "{\n"
+        '  "agent_action": "ASK|DRAFT|UPDATE|FINAL|CHITCHAT",\n'
+        '  "message_to_user": "friendly response to user",\n'
+        '  "draft": {partial or complete template},\n'
+        '  "missing": ["what still needs to be collected"],\n'
+        '  "final_creation_payload": null or {complete template},\n'
+        '  "memory": {facts discovered so far}\n'
+        "}\n\n"
+
+        "Be helpful, intelligent, and production-ready! 🚀"
     )
 
 def build_context_block(draft: Dict[str, Any], memory: Dict[str, Any], cfg: Dict[str, Any]) -> str:
-    policy = {
-        "schema_hard_requirements": ["name","language","category","components(BODY required)"],
-        "button_limits_note": "WhatsApp supports up to ~10 buttons total; visible ≈3; ≤2 URL; ≤1 phone; auth=OTP only.",
-        "footer_limit": "≤60 chars, static; no placeholders.",
-        "header_text_limit": "≤60 chars; ≤1 placeholder.",
-        "body_limit": "≤1024 chars; placeholders {{1..N}}; sequential; not at start/end; not adjacent."
-    }
-
-    # Analyze current state
+    # Analyze what we have vs what we need
     has_category = bool(draft.get("category") or memory.get("category"))
     has_name = bool(draft.get("name"))
     has_language = bool(draft.get("language") or memory.get("language_pref"))
     has_body = any(c.get("type") == "BODY" and c.get("text") for c in (draft.get("components") or []))
 
-    state_summary = {
-        "established_facts": {
-            "category": has_category,
-            "name": has_name, 
-            "language": has_language,
-            "body_content": has_body
-        },
-        "next_logical_step": "Ask for missing required info" if not all([has_category, has_name, has_language, has_body]) else "Ready to finalize"
-    }
+    # Determine what to ask for next
+    if not has_category:
+        next_step = "Ask for template category (Marketing/Utility/Authentication)"
+    elif not has_language:
+        next_step = "Ask for language preference"
+    elif not has_body:
+        next_step = "Ask what message they want to send (the main content)"
+    elif not has_name:
+        next_step = "Ask for template name or suggest one based on content"
+    else:
+        next_step = "Template is ready - offer to finalize"
 
     return (
-        "CURRENT SESSION STATE:\n"
-        f"Draft: {json.dumps(draft, ensure_ascii=False)}\n"
-        f"Memory: {json.dumps(memory or {}, ensure_ascii=False)}\n"
-        f"Progress: {json.dumps(state_summary)}\n\n"
-        f"REQUIREMENTS: {json.dumps(policy)}\n\n"
-        "IMPORTANT: Build upon existing progress. Don't regress or re-ask established facts.\n"
-        "OUTPUT: {agent_action,message_to_user,draft,missing,final_creation_payload,memory}"
+        "📊 CURRENT STATUS:\n"
+        f"✅ Category: {draft.get('category') or memory.get('category') or '❌ Missing'}\n"
+        f"✅ Language: {draft.get('language') or memory.get('language_pref') or '❌ Missing'}\n"
+        f"✅ Name: {draft.get('name') or '❌ Missing'}\n"
+        f"✅ Message Content: {'✅ Has body text' if has_body else '❌ Missing'}\n\n"
+
+        f"🎯 NEXT ACTION: {next_step}\n\n"
+
+        f"📝 Current Draft: {json.dumps(draft, ensure_ascii=False)}\n"
+        f"🧠 Memory: {json.dumps(memory or {}, ensure_ascii=False)}\n\n"
+
+        "💡 TIPS:\n"
+        "- Use {{1}}, {{2}} for placeholders in message text\n"
+        "- Be conversational and build on what user already told you\n"
+        "- Don't re-ask for information you already have\n"
+        "- Interpret user intent smartly (handle typos and variations)"
     )

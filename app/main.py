@@ -190,6 +190,66 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
 
         return {"category": cat, "language": lang, "name": name, "components": components}
 
+    def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
+        """Drop empty/invalid fields coming from the LLM to avoid poisoning the draft."""
+        if not isinstance(cand, dict):
+            return {}
+        c = dict(cand)  # shallow copy is fine
+
+        # strip blank strings
+        for k in ("name", "language", "category"):
+            if k in c and (c[k] is None or (isinstance(c[k], str) and not c[k].strip())):
+                c.pop(k, None)
+
+        # components: remove if empty; also prune empty BUTTONS/FOOTER/HEADER blocks
+        comps = c.get("components")
+        if isinstance(comps, list):
+            clean = []
+            for comp in comps:
+                if not isinstance(comp, dict):
+                    continue
+                t = comp.get("type")
+                if t == "BODY":
+                    txt = (comp.get("text") or "").strip()
+                    if txt:
+                        clean.append({"type": "BODY", "text": txt, **({ "example": comp["example"] } if "example" in comp else {})})
+                elif t == "HEADER":
+                    fmt = comp.get("format")
+                    txt = (comp.get("text") or "").strip()
+                    if fmt == "TEXT" and txt:
+                        clean.append({"type":"HEADER","format":"TEXT","text":txt})
+                    elif fmt in {"IMAGE","VIDEO","DOCUMENT","LOCATION"}:
+                        # keep the slot even without example; preview can show placeholder
+                        clean.append({"type":"HEADER","format":fmt, **({ "example": comp["example"] } if "example" in comp else {})})
+                elif t == "FOOTER":
+                    txt = (comp.get("text") or "").strip()
+                    if txt:
+                        clean.append({"type":"FOOTER","text":txt})
+                elif t == "BUTTONS":
+                    btns = comp.get("buttons")
+                    if isinstance(btns, list) and len(btns) > 0:
+                        # prune obviously broken buttons
+                        b2 = []
+                        for b in btns:
+                            if not isinstance(b, dict) or "type" not in b or "text" not in b:
+                                continue
+                            bt = b["type"]
+                            if bt == "URL" and not b.get("url"):
+                                continue
+                            if bt == "PHONE_NUMBER" and not b.get("phone_number"):
+                                continue
+                            b2.append(b)
+                        if b2:
+                            clean.append({"type":"BUTTONS","buttons":b2})
+            if clean:
+                c["components"] = clean
+            else:
+                c.pop("components", None)
+        elif "components" in c:
+            c.pop("components", None)
+
+        return c
+
     def _compute_missing(p: Dict[str, Any]) -> List[str]:
         miss: List[str] = []
         if not p.get("category"):
@@ -204,71 +264,87 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
             miss.append("body")
         return miss
 
-    # ------------------- 5) Category gate (LLM-led) -------------------
+    # ------------------- 5) Category gate with smart interpretation -------------------
     category = (candidate.get("category")
-                or memory.get("category"))  # LLM is responsible for setting this
+                or memory.get("category")
+                or draft.get("category"))
+
+    if category and not memory.get("category"):
+        memory = merge_deep(memory, {"category": category})
+        s.memory = memory
+
+    # Smart category detection for common typos/variations
+    if not category:
+        user_input_lower = inp.message.lower().strip()
+        category_matches = get_close_matches(user_input_lower, 
+            ["marketing", "utility", "authentication"], n=1, cutoff=0.6)
+        if category_matches:
+            category = category_matches[0].upper()
+            # Update memory with detected category
+            memory["category"] = category
+            memory["category_confidence"] = "auto_detected"
+            s.memory = memory
 
     if not category:
-        # One concise question; no extra logic. LLM must decide category next turn.
-        q = "Which template category should I use — MARKETING, UTILITY, or AUTHENTICATION?"
+        # Provide a natural response that explains the options
+        q = ("Hi! I'd love to help you create a WhatsApp template. "
+             "What type of message do you want to send? For example:\n"
+             "• Marketing messages (promotions, offers, announcements)\n"
+             "• Utility messages (order updates, appointment reminders)\n"
+             "• Authentication messages (verification codes, OTPs)")
         s.last_action = "ASK"
         s.data = {**(s.data or {}), "messages": _append_history(inp.message, q)}
         await upsert_session(db, s); await db.commit()
         return ChatResponse(session_id=s.id, reply=q, draft=draft, missing=["category"], final_creation_payload=None)
 
-    # ------------------- 6) Non-FINAL: always return a draft -------------------
+    # ------------------- 6) Non-FINAL: sanitize, merge, and minimal scaffold when needed -------------------
     if action in {"ASK", "DRAFT", "UPDATE", "CHITCHAT"}:
-        # Only merge if LLM actually provided a valid candidate
-        if candidate:
-            # Validate candidate before merging to prevent malformed data
-            if isinstance(candidate, dict):
-                # Don't accept empty components array or empty language
-                if "components" in candidate and candidate["components"] == []:
-                    candidate.pop("components", None)
-                if "language" in candidate and not candidate["language"]:
-                    candidate.pop("language", None)
-                merged = merge_deep(draft, candidate)
-            else:
-                merged = draft
-        else:
-            merged = draft  # Keep existing draft, don't create dummy content
+        cand_clean = _sanitize_candidate(candidate) if candidate else {}
+        merged = merge_deep(draft, cand_clean) if cand_clean else draft
 
-        # Persist
+        # If category is known but BODY still missing, provide a minimal neutral BODY
+        def _has_body(p: Dict[str, Any]) -> bool:
+            comps = p.get("components") or []
+            return any(isinstance(c, dict) and c.get("type")=="BODY" and (c.get("text") or "").strip() for c in comps)
+
+        if (category or memory.get("category")) and not _has_body(merged):
+            # keep it generic; no hardcoded festivals — still LLM-first
+            merged = merge_deep(merged, {
+                "category": category or memory.get("category"),
+                "language": merged.get("language") or memory.get("language_pref") or "en_US",
+                "name": merged.get("name") or memory.get("proposed_name") or "template",
+                "components": [{"type":"BODY","text":"Hello {{1}}, here is an update: {{2}}."}]
+            })
+
         d.draft = merged
         s.last_action = action
-        s.data = {**(s.data or {}), "messages": _append_history(inp.message, reply or "What would you like me to help you create?")}
+        s.data = {**(s.data or {}), "messages": _append_history(inp.message, reply or "What should I add next?")}
         await upsert_session(db, s); await db.commit()
 
         missing = out.get("missing") or _compute_missing(merged)
-        return ChatResponse(
-            session_id=s.id,
-            reply=reply or "What would you like me to help you create?",
-            draft=merged,
-            missing=missing,
-            final_creation_payload=None,
-        )
+        return ChatResponse(session_id=s.id, reply=reply or "What should I add next?",
+                            draft=merged, missing=missing, final_creation_payload=None)
 
-    # ------------------- 7) FINAL: validate schema + lint (policy from config only) -------------------
+    # ------------------- 7) FINAL: sanitize before validation and storage -------------------
     if action == "FINAL":
-        candidate = candidate or draft or _minimal_scaffold(memory)
+        # sanitize first to avoid writing empty strings/arrays
+        cand_clean = _sanitize_candidate(candidate) if candidate else {}
+        candidate = cand_clean or draft or _minimal_scaffold(memory)
 
         schema = cfg.get("creation_payload_schema", {}) or {}
         issues = validate_schema(candidate, schema)
         issues += lint_rules(candidate, cfg.get("lint_rules", {}) or {})
 
         if issues:
+            # store sanitized candidate (never empty comps/lang) so the user sees a healthy draft
             d.draft = merge_deep(draft, candidate)
             s.last_action = "ASK"
             final_reply = (reply + ("\n\nPlease fix: " + "; ".join(issues) if issues else "")).strip()
             s.data = {**(s.data or {}), "messages": _append_history(inp.message, final_reply)}
             await upsert_session(db, s); await db.commit()
-            return ChatResponse(
-                session_id=s.id,
-                reply=final_reply,
-                draft=d.draft,
-                missing=(out.get("missing") or []) + ["fix_validation_issues"],
-                final_creation_payload=None,
-            )
+            return ChatResponse(session_id=s.id, reply=final_reply, draft=d.draft,
+                                missing=(out.get("missing") or []) + ["fix_validation_issues"],
+                                final_creation_payload=None)
 
         # Valid → finalize
         d.finalized_payload = candidate
