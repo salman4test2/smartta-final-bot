@@ -218,16 +218,25 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
 
     # ------------------- 6) Non-FINAL: always return a draft -------------------
     if action in {"ASK", "DRAFT", "UPDATE", "CHITCHAT"}:
-        # Only merge if LLM actually provided a candidate, don't auto-scaffold
+        # Only merge if LLM actually provided a valid candidate
         if candidate:
-            merged = merge_deep(draft, candidate)
+            # Validate candidate before merging to prevent malformed data
+            if isinstance(candidate, dict):
+                # Don't accept empty components array or empty language
+                if "components" in candidate and candidate["components"] == []:
+                    candidate.pop("components", None)
+                if "language" in candidate and not candidate["language"]:
+                    candidate.pop("language", None)
+                merged = merge_deep(draft, candidate)
+            else:
+                merged = draft
         else:
             merged = draft  # Keep existing draft, don't create dummy content
 
         # Persist
         d.draft = merged
         s.last_action = action
-        s.data = {**(s.data or {}), "messages": _append_history(inp.message, reply or "Draft prepared.")}
+        s.data = {**(s.data or {}), "messages": _append_history(inp.message, reply or "What would you like me to help you create?")}
         await upsert_session(db, s); await db.commit()
 
         missing = out.get("missing") or _compute_missing(merged)
