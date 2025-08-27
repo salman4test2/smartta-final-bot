@@ -218,9 +218,11 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
 
     # ------------------- 6) Non-FINAL: always return a draft -------------------
     if action in {"ASK", "DRAFT", "UPDATE", "CHITCHAT"}:
-        if not candidate:
-            candidate = _minimal_scaffold(memory)  # thin fallback; relies on LLM memory only
-        merged = merge_deep(draft, candidate) if candidate else draft
+        # Only merge if LLM actually provided a candidate, don't auto-scaffold
+        if candidate:
+            merged = merge_deep(draft, candidate)
+        else:
+            merged = draft  # Keep existing draft, don't create dummy content
 
         # Persist
         d.draft = merged
@@ -231,7 +233,7 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         missing = out.get("missing") or _compute_missing(merged)
         return ChatResponse(
             session_id=s.id,
-            reply=reply or "Draft prepared. Would you like me to finalize?",
+            reply=reply or "What would you like me to help you create?",
             draft=merged,
             missing=missing,
             final_creation_payload=None,
@@ -275,15 +277,19 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         )
 
     # ------------------- 8) Fallback: behave like ASK with scaffold -------------------
-    candidate = candidate or _minimal_scaffold(memory)
-    d.draft = candidate
+    # Only scaffold if we have enough information and current draft is empty
+    if not candidate and not draft and memory.get("category"):
+        candidate = _minimal_scaffold(memory)
+
+    final_draft = candidate or draft
+    d.draft = final_draft
     s.last_action = "ASK"
-    s.data = {**(s.data or {}), "messages": _append_history(inp.message, reply or "Draft prepared.")}
+    s.data = {**(s.data or {}), "messages": _append_history(inp.message, reply or "What would you like me to help you create?")}
     await upsert_session(db, s); await db.commit()
     return ChatResponse(
         session_id=s.id,
-        reply=reply or "Draft prepared. What would you like to change?",
-        draft=candidate,
-        missing=_compute_missing(candidate),
+        reply=reply or "What would you like me to help you create?",
+        draft=final_draft,
+        missing=_compute_missing(final_draft),
         final_creation_payload=None,
     )
