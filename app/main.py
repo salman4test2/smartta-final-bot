@@ -147,7 +147,7 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
         for comp in comps:
             if not isinstance(comp, dict):
                 continue
-            t = comp.get("type")
+            t = (comp.get("type") or "").strip().upper()
             if t == "BODY":
                 txt = (comp.get("text") or "").strip()
                 if txt:
@@ -156,15 +156,21 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
                         out["example"] = comp["example"]
                     clean.append(out)
             elif t == "HEADER":
-                fmt = comp.get("format")
+                fmt = (comp.get("format") or "").strip().upper()
                 txt = (comp.get("text") or "").strip()
+
+                # If model gave header text but omitted format, default to TEXT
+                if not fmt and txt:
+                    fmt = "TEXT"
+
                 if fmt == "TEXT" and txt:
-                    clean.append({"type":"HEADER","format":"TEXT","text":txt})
-                elif fmt in {"IMAGE","VIDEO","DOCUMENT","LOCATION"}:
-                    out = {"type":"HEADER","format":fmt}
+                    clean.append({"type": "HEADER", "format": "TEXT", "text": txt})
+                elif fmt in {"IMAGE", "VIDEO", "DOCUMENT", "LOCATION"}:
+                    # keep media/location slot even without example; preview can show placeholder
+                    item = {"type": "HEADER", "format": fmt}
                     if "example" in comp:
-                        out["example"] = comp["example"]
-                    clean.append(out)
+                        item["example"] = comp["example"]
+                    clean.append(item)
             elif t == "FOOTER":
                 txt = (comp.get("text") or "").strip()
                 if txt:
@@ -192,15 +198,32 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
         c.pop("components", None)
     return c
 
-def _compute_missing(p: Dict[str, Any]) -> List[str]:
+def _has_component(p: Dict[str, Any], kind: str) -> bool:
+    return any(
+        isinstance(c, dict) and (c.get("type") or "").upper() == kind
+        for c in (p.get("components") or [])
+    )
+
+def _compute_missing(p: Dict[str, Any], memory: Dict[str, Any]) -> List[str]:
     miss: List[str] = []
     if not p.get("category"): miss.append("category")
     if not p.get("language"): miss.append("language")
     if not p.get("name"):     miss.append("name")
+
     comps = p.get("components") or []
-    has_body = any(isinstance(c, dict) and c.get("type")=="BODY" and (c.get("text") or "").strip()
-                   for c in comps)
+    has_body = any(
+        isinstance(c, dict) and (c.get("type") or "").upper() == "BODY" and (c.get("text") or "").strip()
+        for c in comps
+    )
     if not has_body: miss.append("body")
+
+    # If user explicitly asked for extras, require them before FINAL
+    if memory.get("wants_header") and not _has_component(p, "HEADER"):
+        miss.append("header")
+    if memory.get("wants_footer") and not _has_component(p, "FOOTER"):
+        miss.append("footer")
+    if memory.get("wants_buttons") and not _has_component(p, "BUTTONS"):
+        miss.append("buttons")
     return miss
 
 def _slug(s_: str) -> str:
@@ -294,6 +317,15 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
     system = build_system_prompt(cfg)
     context = build_context_block(draft, memory, cfg)
     safe_message = _sanitize_user_input(inp.message)
+    # Track explicit requests so we can block FINAL until they exist
+    lower_msg = safe_message.lower()
+    if "header" in lower_msg:
+        memory["wants_header"] = True
+    if "footer" in lower_msg:
+        memory["wants_footer"] = True
+    if "button" in lower_msg or "buttons" in lower_msg:
+        memory["wants_buttons"] = True
+    s.memory = memory
 
     current_state = _determine_conversation_state(draft, memory)
     user_intent = _classify_user_intent(safe_message, current_state)
@@ -360,7 +392,7 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         s.data = {**(s.data or {}), "messages": _append_history(inp.message, reply or "What should I add next?")}
         await upsert_session(db, s); await db.commit()
 
-        missing = out.get("missing") or _compute_missing(merged)
+        missing = out.get("missing") or _compute_missing(merged, memory)
         return ChatResponse(session_id=s.id, reply=reply or "What should I add next?",
                             draft=merged, missing=missing, final_creation_payload=None)
 
@@ -368,6 +400,37 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
     if action == "FINAL":
         cand_clean = _sanitize_candidate(candidate) if candidate else {}
         candidate = cand_clean or draft or _minimal_scaffold(memory)
+
+        def _has_component_kind(p: Dict[str, Any], kind: str) -> bool:
+            return any(
+                isinstance(c, dict) and (c.get("type") or "").upper() == kind
+                for c in (p.get("components") or [])
+            )
+
+        missing_extras = []
+        if memory.get("wants_header") and not _has_component_kind(candidate, "HEADER"):
+            missing_extras.append("header")
+        if memory.get("wants_footer") and not _has_component_kind(candidate, "FOOTER"):
+            missing_extras.append("footer")
+        if memory.get("wants_buttons") and not _has_component_kind(candidate, "BUTTONS"):
+            missing_extras.append("buttons")
+
+        if missing_extras:
+            d.draft = merge_deep(draft, candidate)
+            s.last_action = "ASK"
+            ask = "You asked for {}. Should I add them now? For header, I can add a TEXT header like “Festive offer just for you!” (≤60 chars).".format(
+                ", ".join(missing_extras)
+            )
+            s.data = {**(s.data or {}), "messages": _append_history(inp.message, ask)}
+            await upsert_session(db, s);
+            await db.commit()
+            return ChatResponse(
+                session_id=s.id,
+                reply=ask,
+                draft=d.draft,
+                missing=_compute_missing(d.draft, memory),
+                final_creation_payload=None
+            )
 
         schema = cfg.get("creation_payload_schema", {}) or {}
         issues = validate_schema(candidate, schema)
@@ -399,5 +462,5 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
     s.data = {**(s.data or {}), "messages": _append_history(inp.message, reply or "What would you like me to help you create?")}
     await upsert_session(db, s); await db.commit()
     return ChatResponse(session_id=s.id, reply=reply or "What would you like me to help you create?",
-                        draft=final_draft, missing=_compute_missing(final_draft),
+                        draft=final_draft, missing = _compute_missing(final_draft, memory),
                         final_creation_payload=None)
