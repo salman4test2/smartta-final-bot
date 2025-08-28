@@ -1,0 +1,188 @@
+# WhatsApp Template Builder – Quick Guide
+
+A concise, practical guide for product/ops teams using the LLM‑first WhatsApp Template Builder.
+
+---
+
+## 1) What this app does (context)
+
+* **Goal:** Help a user (via chat) produce a **valid WhatsApp Business template payload** that can be sent to Meta for approval.
+* **How:** The assistant gathers details in any order, fills a **draft** (`{name, language, category, components[]}`), validates it, and outputs a **final\_creation\_payload** when complete.
+* **Non‑goals:** Sending messages, analytics, routing, scheduling. This is **creation only**.
+
+---
+
+## 2) Message categories (pick one per template)
+
+### A) MARKETING
+
+* **Purpose:** Promotions, announcements, offers, sales, new launches, seasonal/holiday greetings with a call to action.
+* **Notes:** Can include **Header** (text/media\*), **Footer**, **Buttons**.
+* **Typical buttons:** Quick replies (e.g., "Shop now", "Remind me"), URL (e.g., product/landing page), Phone.
+
+### B) UTILITY (a.k.a. Transactional/Service)
+
+* **Purpose:** Order updates, appointments, invoices, alerts, payment confirmations, shipping/delivery.
+* **Notes:** May include Header/Footer/Buttons. Content should relate to a **recent transaction or service**.
+
+### C) AUTHENTICATION (OTP)
+
+* **Purpose:** One‑time passcodes and verification.
+* **Notes:** **No custom media or buttons.** Keep it OTP‑focused. Include the code placeholder and (optionally) expiry.
+
+> \*Media in Header supports TEXT/IMAGE/VIDEO/DOCUMENT/LOCATION. Media is a **slot** in the template; the actual file/ID is attached at send‑time.
+
+---
+
+## 3) Template structure & fields
+
+Every template must pass the creation schema:
+
+* **name** *(required)* – snake\_case, lowercase letters/numbers/underscores, ≤ 64 chars. Example: `diwali_sweets_offer`.
+* **language** *(required)* – e.g., `en_US`, `hi_IN`, `es_MX`.
+* **category** *(required)* – one of `MARKETING | UTILITY | AUTHENTICATION`.
+* **components\[]** *(required, non‑empty)* – ordered list of parts:
+
+  * **BODY** *(required; exactly one)*
+
+    * Up to **1024 chars**.
+    * May include placeholders `{{1}}..{{N}}` (sequential; avoid start/end and back‑to‑back variables).
+  * **HEADER** *(optional)*
+
+    * `format`: `TEXT | IMAGE | VIDEO | DOCUMENT | LOCATION`.
+    * If `TEXT`, max **60 chars**; at most **one placeholder** allowed.
+  * **FOOTER** *(optional)*
+
+    * Static text, max **60 chars** (no placeholders).
+  * **BUTTONS** *(optional)*
+
+    * Types: `QUICK_REPLY | URL | PHONE_NUMBER`.
+    * Practical limits: \~**3 visible** (with "see all" beyond), **≤ 2 URL**, **≤ 1 phone**; total ≤ \~10.
+
+> **AUTHENTICATION** templates must **not** add custom buttons or media.
+
+---
+
+## 4) Conversational flow (slot‑based, any order)
+
+The assistant detects which fields are **present** vs **missing** and progresses accordingly.
+
+### A) MARKETING flow
+
+1. **Infer/confirm intent** (e.g., "Diwali offer", "Black Friday", "new collection").
+2. **Body** – If user says "you choose", the assistant proposes a short, on‑brand BODY (with placeholders if needed) and asks for approval.
+3. **Language** – Mirror user's language or ask for a specific code if unclear.
+4. **Name** – Propose `snake_case` name; accept edits.
+5. **Extras** – Offer **Header** (e.g., short text like "Festive offer just for you!"), **Footer**, and **Buttons** (e.g., quick replies: "View collection", "Order now"; URL: product page; Phone: call).
+6. **Validate & Finalize** – On approval, produce `final_creation_payload`.
+
+### B) UTILITY flow
+
+1. **Infer/confirm** utility intent (shipping, appointment, payment, invoice, alert).
+2. **Body** – Include concrete details via placeholders (e.g., name, order\_id, status/slot/time).
+3. **Language** & **Name** – Same as above.
+4. **Extras** – Optional Header/Footer. Common button: **URL** "Track order".
+5. **Validate & Finalize**.
+
+### C) AUTHENTICATION flow
+
+1. **Fix category to AUTHENTICATION**.
+2. **Body** – OTP code and optional expiry: `"{{1}} is your verification code. This code expires in {{2}} minutes."`
+3. **Language** & **Name** – Same as above.
+4. **No buttons/media**. Validate & Finalize.
+
+---
+
+## 5) Common examples
+
+### Example 1 – Marketing (Holiday Promo)
+
+* **Body:** "Wishing you a joyous Diwali, {{1}}! Enjoy {{2}}% off our festive sweets."
+* **Header (TEXT):** "Festive offer just for you!"
+* **Buttons:** Quick Reply "View Collection", Quick Reply "Order Now".
+
+### Example 2 – Utility (Order Shipped)
+
+* **Body:** "Hello {{1}}, your order {{2}} has shipped. Latest status: {{3}}."
+* **Buttons:** URL "Track Order" → `https://example.com/track/{{2}}`.
+
+### Example 3 – Authentication (OTP)
+
+* **Body:** "{{1}} is your verification code. For your security, do not share it. Expires in {{2}} minutes."
+
+---
+
+## 6) Do’s & Don’ts
+
+**Do**
+
+* Keep BODY concise and specific; use placeholders for personal data.
+* Confirm derived details (name/language) in one line when inferred from chat.
+* Offer extras (Header/Footer/Buttons) once before finalize for MARKETING/UTILITY.
+
+**Don’t**
+
+* Don’t add buttons/media to AUTHENTICATION.
+* Don’t put placeholders in FOOTER; avoid more than one in HEADER TEXT.
+* Don’t finalize without explicit user confirmation and a clean schema pass.
+
+---
+
+## 7) Minimal payload shapes
+
+**Marketing (minimal):**
+
+```json
+{
+  "name": "diwali_sweets_offer",
+  "language": "en_US",
+  "category": "MARKETING",
+  "components": [
+    {"type": "BODY", "text": "Wishing you a joyous Diwali, {{1}}! Enjoy {{2}}% off our festive sweets."}
+  ]
+}
+```
+
+**Utility (minimal):**
+
+```json
+{
+  "name": "order_update",
+  "language": "en_US",
+  "category": "UTILITY",
+  "components": [
+    {"type": "BODY", "text": "Hello {{1}}, your order {{2}} has been updated. Latest status: {{3}}."}
+  ]
+}
+```
+
+**Authentication (minimal):**
+
+```json
+{
+  "name": "login_otp",
+  "language": "en_US",
+  "category": "AUTHENTICATION",
+  "components": [
+    {"type": "BODY", "text": "{{1}} is your verification code. This code expires in {{2}} minutes."}
+  ]
+}
+```
+
+---
+
+## 8) Quick troubleshooting
+
+* **“I need more information before finalizing.”** → At least one of `name/language/category/BODY` is missing. Provide it or say “you choose” and approve the suggestion.
+* **Buttons missing after I asked for them.** → Confirm with “yes, add two quick reply buttons: ‘View’ and ‘Order’”. The assistant will append and show the draft.
+* **Language not sticking.** → Provide explicit code (e.g., `hi_IN`) instead of “Hindi”.
+
+---
+
+## 9) Glossary (quick)
+
+* **Placeholder:** `{{1}}` style variable replaced at send time.
+* **Quick Reply:** A button that returns a short payload (used for user choices).
+* **URL Button:** Opens a link (can include placeholders).
+* **Phone Button:** Tap‑to‑call.
+* **Final Payload:** The creation payload returned when all required fields are complete and approved in chat.
