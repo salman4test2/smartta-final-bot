@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    String, Integer, DateTime, func, JSON, ForeignKey, CheckConstraint, Index
+    String, Integer, DateTime, func, JSON, ForeignKey, CheckConstraint, Index, UniqueConstraint
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -35,8 +35,7 @@ class User(Base):
 
 class UserSession(Base):
     __tablename__ = "user_sessions"
-    __table_args__ = (UniqueConstraint("user_id", "session_id", name="uq_user_session"), )
-
+    
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     
     # Foreign key to users table
