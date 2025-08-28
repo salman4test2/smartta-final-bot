@@ -35,7 +35,8 @@ class User(Base):
 
 class UserSession(Base):
     __tablename__ = "user_sessions"
-    
+    __table_args__ = (UniqueConstraint("user_id", "session_id", name="uq_user_session"), )
+
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     
     # Foreign key to users table
@@ -66,6 +67,11 @@ class UserSession(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+    
+    # Prevent duplicate user-session associations
+    __table_args__ = (
+        Index("idx_user_session_unique", "user_id", "session_id", unique=True),
     )
 
 

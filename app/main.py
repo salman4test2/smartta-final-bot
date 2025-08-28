@@ -140,19 +140,19 @@ async def on_startup():
     except Exception:
         pass
 
+    # create tables
+    async with engine.begin() as aconn:
+        await aconn.run_sync(Base.metadata.create_all)
+
+    # apply SQLite PRAGMAs (no-op on Postgres)
     try:
-        async with engine.begin() as aconn:
-            await aconn.run_sync(Base.metadata.create_all)
-    except Exception as e:
-        print(f"[WARNING] Table creation failed, probably already exist: {e}")
-        # Tables might already exist, continue anyway
-        try:
-            if engine.url.drivername.startswith("sqlite"):
+        if engine.url.drivername.startswith("sqlite"):
+            async with engine.begin() as aconn:
                 await aconn.exec_driver_sql("PRAGMA journal_mode=WAL;")
                 await aconn.exec_driver_sql("PRAGMA synchronous=NORMAL;")
                 await aconn.exec_driver_sql("PRAGMA foreign_keys=ON;")
-        except Exception:
-            pass
+    except Exception:
+        pass
 
 # ---------- Helpers ----------
 
@@ -431,6 +431,11 @@ def _auto_apply_extras_on_yes(user_text: str, candidate: Dict[str, Any], memory:
     cand = dict(candidate or {})
     comps = list((cand.get("components") or []))
 
+    # block extras for AUTHENTICATION
+    cat = (memory.get("category") or cand.get("category") or "").upper()
+    if cat == "AUTHENTICATION":
+        return cand
+
     def has(kind: str) -> bool:
         return any(isinstance(c, dict) and (c.get("type") or "").upper() == kind for c in comps)
 
@@ -643,13 +648,8 @@ async def new_session_get(user_id: str = None, db: AsyncSession = Depends(get_db
         user = user_result.scalar_one_or_none()
         
         if user:
-            # Create user session association
-            user_session = UserSession(
-                user_id=user_id,
-                session_id=s.id,
-                session_name=None  # Can be set later
-            )
-            db.add(user_session)
+            # Create user session association using upsert
+            await _upsert_user_session(db, user_id, s.id, None)
     
     await db.commit()
     return {"session_id": s.id}
@@ -674,13 +674,8 @@ async def new_session_post(session_data: SessionCreate, db: AsyncSession = Depen
         user = user_result.scalar_one_or_none()
         
         if user:
-            # Create user session association with the provided name
-            user_session = UserSession(
-                user_id=user_id,
-                session_id=s.id,
-                session_name=session_name
-            )
-            db.add(user_session)
+            # Create user session association with the provided name using upsert
+            await _upsert_user_session(db, user_id, s.id, session_name)
     
     await db.commit()
     return SessionCreateResponse(
@@ -867,60 +862,52 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
                            {"role": "assistant", "content": assistant_text}]
         return new_hist[-max_turns:]
 
-    # 4) Let LLM drive category; don't inject server question
+    # 5) Let the LLM drive category; don't inject server question
     category = (candidate.get("category") or memory.get("category") or draft.get("category"))
     if category and not memory.get("category"):
         s.memory = merge_deep(memory, {"category": category})
 
-    # 5) Non-FINAL → merge sanitized candidate (with extras auto-apply on "yes")
+    # Helper to persist a turn
+    async def _persist_turn_and_return(reply_text: str, new_draft: Dict[str, Any], missing_list: List[str]):
+        s.last_action = action
+        s.data = {**(s.data or {}), "messages": _append_history(inp.message, reply_text)}
+        await _update_user_session_if_needed(db, inp.user_id, s.id)
+        await upsert_session(db, s); await db.commit()
+        return ChatResponse(session_id=s.id, reply=reply_text, draft=new_draft,
+                            missing=missing_list, final_creation_payload=None)
+
+    # 6) Non-FINAL → merge sanitized candidate (with extras auto-apply on "yes")
     if action in {"ASK","DRAFT","UPDATE","CHITCHAT"}:
         candidate = _auto_apply_extras_on_yes(safe_message, candidate, memory)
         cand_clean = _sanitize_candidate(candidate) if candidate else {}
         merged = merge_deep(draft, cand_clean) if cand_clean else draft
 
-        # if language still missing, try to normalize from user text like "english"
+        # opportunistic language normalization from the message
         if not merged.get("language"):
             lang_guess = _normalize_language(safe_message)
             if lang_guess:
                 merged["language"] = lang_guess
 
         d.draft = merged
-        s.last_action = action
 
-        # Trust LLM's missing calculation, but supplement with any obvious gaps
+        # Trust LLM's missing, supplement only if obviously incomplete
         llm_missing = out.get("missing") or []
         computed_missing = _compute_missing(merged, memory)
-        
-        # Use LLM missing as primary, only add computed missing if LLM missed something obvious
-        missing = llm_missing[:]
-        for item in computed_missing:
-            if item not in missing and item in ["category", "language", "name", "body"]:
-                missing.append(item)
-        
-        final_reply = reply or _targeted_missing_reply(missing)
+        missing = list(dict.fromkeys(llm_missing + [m for m in computed_missing if m in ["category","language","name","body"]]))
 
-    s.data = {**(s.data or {}), "messages": _append_history(inp.message, final_reply)}
-    
-    # Update user session if this session is associated with a user
-    await _update_user_session_if_needed(db, inp.user_id, s.id)
-    
-    await upsert_session(db, s); await db.commit()
-    return ChatResponse(session_id=s.id, reply=final_reply,
-                        draft=merged, missing=missing, final_creation_payload=None)
+        final_reply = (reply or _targeted_missing_reply(missing)).strip()
+        return await _persist_turn_and_return(final_reply, merged, missing)
 
-    # 6) FINAL → sanitize -> validate -> persist (also enforce requested extras)
+    # 7) FINAL → sanitize -> validate -> persist (also enforce requested extras)
     if action == "FINAL":
         candidate = _auto_apply_extras_on_yes(safe_message, candidate, memory)
         cand_clean = _sanitize_candidate(candidate) if candidate else {}
         candidate = cand_clean or draft or _minimal_scaffold(memory)
 
-        # enforce extras if user asked for them but they are still missing
         def _has_component_kind(p: Dict[str, Any], kind: str) -> bool:
-            return any(
-                isinstance(c, dict) and (c.get("type") or "").upper() == kind
-                for c in (p.get("components") or [])
-            )
+            return any(isinstance(c, dict) and (c.get("type") or "").upper() == kind for c in (p.get("components") or []))
 
+        # enforce requested extras before validate
         missing_extras = []
         if memory.get("wants_header") and not _has_component_kind(candidate, "HEADER"):
             missing_extras.append("header")
@@ -930,20 +917,15 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
             missing_extras.append("buttons")
 
         if missing_extras:
-            # ask a single targeted question rather than finalize
             d.draft = merge_deep(draft, candidate)
             s.last_action = "ASK"
             ask = _targeted_missing_reply(missing_extras)
             s.data = {**(s.data or {}), "messages": _append_history(inp.message, ask)}
             await _update_user_session_if_needed(db, inp.user_id, s.id)
             await upsert_session(db, s); await db.commit()
-            return ChatResponse(
-                session_id=s.id,
-                reply=ask,
-                draft=d.draft,
-                missing=_compute_missing(d.draft, memory),
-                final_creation_payload=None
-            )
+            return ChatResponse(session_id=s.id, reply=ask, draft=d.draft,
+                                missing=_compute_missing(d.draft, memory),
+                                final_creation_payload=None)
 
         schema = cfg.get("creation_payload_schema", {}) or {}
         issues = validate_schema(candidate, schema)
@@ -960,6 +942,7 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
                                 missing=_compute_missing(d.draft, memory) + ["fix_validation_issues"],
                                 final_creation_payload=None)
 
+        # Valid → finalize
         d.finalized_payload = candidate
         d.status = "FINAL"
         d.draft = candidate
@@ -967,36 +950,68 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         s.data = {**(s.data or {}), "messages": _append_history(inp.message, reply or "Finalized.")}
         await _update_user_session_if_needed(db, inp.user_id, s.id)
         await upsert_session(db, s); await db.commit()
-        return ChatResponse(session_id=s.id, reply=reply or "Finalized.",
-                            draft=d.draft, missing=None, final_creation_payload=candidate)
+        return ChatResponse(session_id=s.id, reply=reply or "Finalized.", draft=d.draft,
+                            missing=None, final_creation_payload=candidate)
 
-    # 7) Fallback (treat as ASK)
+    # 8) Fallback (treat as ASK)
     final_draft = candidate or draft
     d.draft = final_draft
     s.last_action = "ASK"
     missing = _compute_missing(final_draft, memory)
-    final_reply = reply or _targeted_missing_reply(missing)
+    final_reply = (reply or _targeted_missing_reply(missing)).strip()
+
+    # anti-loop: if same question and user affirmed, proactively fill one slot
     if final_reply.endswith("?"):
         qh = _qhash(final_reply)
         if s.last_question_hash == qh and _is_affirmation(safe_message):
-            # auto-apply extras and try to fill a single missing slot
-            merged = merge_deep(merged, _auto_apply_extras_on_yes(safe_message, {}, memory))
+            base = dict(final_draft)  # <-- avoid using undefined 'merged'
+            base = merge_deep(base, _auto_apply_extras_on_yes(safe_message, {}, memory))
             if "language" in missing:
-                guess = _normalize_language(safe_message) or memory.get("language_pref") or "en_US"
-                merged["language"] = guess
-            if "name" in missing and ("you choose" in safe_message.lower() or "suggest" in safe_message.lower()):
-                merged["name"] = _slug(memory.get("event_label") or "template")
+                base["language"] = _normalize_language(safe_message) or memory.get("language_pref") or "en_US"
+            if "name" in missing and any(k in safe_message.lower() for k in ["you choose","suggest","pick a name"]):
+                base["name"] = _slug(memory.get("event_label") or "template")
             if "body" in missing and "you choose" in safe_message.lower():
-                # keep it short & compliant; the LLM will refine next turn
-                merged.setdefault("components", []).insert(0, {"type": "BODY", "text": "Hi {{1}}, we have a special offer for you!"})
-            d.draft = merged
-            final_reply = _targeted_missing_reply(_compute_missing(merged, memory))
-        # store hash (or clear if not a question)
+                base.setdefault("components", []).insert(0, {"type": "BODY", "text": "Hi {{1}}, we have a special offer for you!"})
+            d.draft = base
+            final_draft = base
+            missing = _compute_missing(final_draft, memory)
+            final_reply = _targeted_missing_reply(missing)
         s.last_question_hash = qh
     else:
-        s.last_question_hash = None # not a question      
+        s.last_question_hash = None
+
     s.data = {**(s.data or {}), "messages": _append_history(inp.message, final_reply)}
+    await _update_user_session_if_needed(db, inp.user_id, s.id)
     await upsert_session(db, s); await db.commit()
-    return ChatResponse(session_id=s.id, reply=final_reply,
-                        draft=final_draft, missing=missing,
-                        final_creation_payload=None)
+    return ChatResponse(session_id=s.id, reply=final_reply, draft=final_draft,
+                        missing=missing, final_creation_payload=None)
+
+async def _upsert_user_session(db: AsyncSession, user_id: str, session_id: str, session_name: str = None):
+    """Create or update a user session association"""
+    from sqlalchemy import select, update, func
+    
+    # Check if user session association already exists
+    result = await db.execute(
+        select(UserSession).where(
+            UserSession.user_id == user_id,
+            UserSession.session_id == session_id
+        )
+    )
+    existing = result.scalar_one_or_none()
+    
+    if existing:
+        # Update existing if session_name is provided
+        if session_name is not None:
+            await db.execute(
+                update(UserSession)
+                .where(UserSession.user_id == user_id, UserSession.session_id == session_id)
+                .values(session_name=session_name, updated_at=func.now())
+            )
+    else:
+        # Create new
+        user_session = UserSession(
+            user_id=user_id,
+            session_id=session_id,
+            session_name=session_name
+        )
+        db.add(user_session)
