@@ -312,6 +312,8 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
     comps = c.get("components")
     if isinstance(comps, list):
         clean = []
+        collected_buttons = []  # Collect individual button components
+        
         for comp in comps:
             if not isinstance(comp, dict):
                 continue
@@ -342,6 +344,7 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
             elif t == "BUTTONS":
                 btns = comp.get("buttons")
                 if isinstance(btns, list) and btns:
+                    # Standard format: BUTTONS component with buttons array
                     b2 = []
                     for b in btns:
                         if not isinstance(b, dict) or "type" not in b or "text" not in b:
@@ -354,6 +357,18 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
                         b2.append(b)
                     if b2:
                         clean.append({"type":"BUTTONS","buttons":b2})
+                elif comp.get("text"):
+                    # Malformed format: Individual BUTTONS component with text
+                    # Collect these to convert to proper format
+                    btn_text = comp.get("text").strip()
+                    btn_type = comp.get("button_type", "QUICK_REPLY")
+                    if btn_text:
+                        collected_buttons.append({"type": btn_type, "text": btn_text})
+        
+        # Convert collected individual buttons to proper BUTTONS component
+        if collected_buttons:
+            clean.append({"type": "BUTTONS", "buttons": collected_buttons})
+                        
         if clean:
             c["components"] = clean
         else:
