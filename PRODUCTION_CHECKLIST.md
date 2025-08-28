@@ -16,6 +16,13 @@
 - [x] **Table creation** - All schemas properly deployed
 - [x] **Data persistence** - Sessions and chats stored reliably
 
+### 🔒 Security & Version Control
+- [x] **Comprehensive .gitignore** - Protects sensitive files and artifacts
+- [x] **Environment variables** - .env files excluded from git
+- [x] **Database files** - Local .db files ignored
+- [x] **Python artifacts** - __pycache__ and .pyc files excluded
+- [x] **Build artifacts** - egg-info and dist folders ignored
+
 ### 📡 API Endpoints
 - [x] `POST /chat` - Main conversation interface
 - [x] `GET /session/new` - Create new sessions  
