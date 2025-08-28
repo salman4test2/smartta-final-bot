@@ -187,6 +187,8 @@ GET /session/{session_id}
 }
 ```
 
+**Note:** This endpoint is useful for resuming conversations and understanding the current state of template creation. The `last_action` field indicates whether the template is still being built ("ASK", "DRAFT") or finalized ("FINAL").
+
 ### 5. Debug Session Data (NEW!)
 ```http
 GET /session/{session_id}/debug
@@ -679,4 +681,70 @@ curl -X GET "http://localhost:8000/users/test_user/sessions"
 curl -X PUT "http://localhost:8000/users/test_user/sessions/SESSION_ID/name?session_name=New%20Name"
 ```
 
----
+## 🔧 Troubleshooting Common Issues
+
+### Template Creation Stuck in Loop
+
+**Problem:** User requests buttons/header but system keeps asking the same confirmation question.
+
+**Solution:** This issue was resolved in the latest version. The backend now properly handles malformed button responses from the LLM and converts them to the correct format.
+
+**Example Flow:**
+```javascript
+// User: "add 2 buttons"
+// Bot: "Should I add two quick replies like 'View offers' and 'Order now'?"
+// User: "yes"
+// Bot: ✅ Template finalized with buttons (not stuck in loop)
+```
+
+### Button Format Issues
+
+**Technical Details:** The LLM sometimes generates individual button components instead of a single BUTTONS component with nested buttons array. The backend now automatically converts:
+
+```json
+// Malformed (old issue):
+{"type": "BUTTONS", "text": "Shop Now"}
+{"type": "BUTTONS", "text": "View Offers"}
+
+// To Correct Format:
+{
+  "type": "BUTTONS",
+  "buttons": [
+    {"type": "QUICK_REPLY", "text": "Shop Now"},
+    {"type": "QUICK_REPLY", "text": "View Offers"}
+  ]
+}
+```
+
+### Debug Session Issues
+
+**Using Debug Endpoint:**
+```bash
+curl -X GET "http://localhost:8000/session/{session_id}/debug"
+```
+
+This endpoint provides complete session information including:
+- Chat history
+- Current template draft
+- LLM interaction logs
+- Memory/context state
+- Session metadata
+
+### Session Naming Issues
+
+**Auto-naming:** If session names aren't being generated automatically, ensure:
+1. `user_id` is provided in chat requests
+2. Session is created with user association
+3. First message is descriptive enough for name generation
+
+**Manual naming:** Use the POST method for session creation:
+```javascript
+const response = await fetch('/session/new', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    user_id: 'user123',
+    session_name: 'Custom Template Name'
+  })
+});
+```
