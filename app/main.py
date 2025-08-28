@@ -9,13 +9,17 @@ import re
 import datetime as dt
 
 from .db import engine, SessionLocal, Base
-from .models import Session as DBSession, Draft
+from .models import Session as DBSession, Draft, User, UserSession
 from .repo import get_or_create_session, upsert_session, create_draft, log_llm
 from .config import get_config, reload_config
 from .prompts import build_system_prompt, build_context_block
 from .llm import LlmClient
 from .validator import validate_schema, lint_rules
-from .schemas import ChatInput, ChatResponse, SessionData, ChatMessage, SessionDebugData, LLMLogEntry
+from .schemas import (
+    ChatInput, ChatResponse, SessionData, ChatMessage, SessionDebugData, LLMLogEntry,
+    UserCreate, UserResponse, UserLogin, UserSessionInfo, UserSessionsResponse,
+    SessionCreate, SessionCreateResponse
+)
 from .utils import merge_deep
 
 app = FastAPI(title="LLM-First WhatsApp Template Builder", version="4.0.0")
@@ -24,6 +28,96 @@ import hashlib
 
 def _qhash(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8")).hexdigest()[:12]
+
+async def _update_user_session_if_needed(db: AsyncSession, user_id: str, session_id: str):
+    """Helper function to update user session timestamp when user sends a message"""
+    if not user_id:
+        return
+        
+    from sqlalchemy import select, update, func
+    
+    # Check if user session association exists
+    user_session_result = await db.execute(
+        select(UserSession).where(
+            UserSession.user_id == user_id,
+            UserSession.session_id == session_id
+        )
+    )
+    user_session = user_session_result.scalar_one_or_none()
+    
+    if user_session:
+        # Update the user session timestamp
+        await db.execute(
+            update(UserSession)
+            .where(UserSession.user_id == user_id, UserSession.session_id == session_id)
+            .values(updated_at=func.now())
+        )
+    else:
+        # Create new user session association if it doesn't exist
+        new_user_session = UserSession(
+            user_id=user_id,
+            session_id=session_id,
+            session_name=None
+        )
+        db.add(new_user_session)
+
+def _generate_session_name_from_message(message: str, category: str = None) -> str:
+    """Generate a meaningful session name from the first user message"""
+    import re
+    
+    # Clean the message
+    clean_msg = re.sub(r'[^\w\s]', '', message.lower())
+    words = clean_msg.split()
+    
+    # Remove common words
+    stop_words = {'i', 'want', 'to', 'create', 'a', 'for', 'the', 'and', 'or', 'but', 'make', 'template', 'whatsapp'}
+    meaningful_words = [w for w in words if w not in stop_words and len(w) > 2]
+    
+    # Take first 3-4 meaningful words
+    name_words = meaningful_words[:4] if len(meaningful_words) >= 4 else meaningful_words[:3]
+    
+    # Add category if available
+    if category and category != 'UNKNOWN':
+        if category == 'MARKETING':
+            name_words.append('promotion')
+        elif category == 'UTILITY':
+            name_words.append('notification')
+        elif category == 'AUTHENTICATION':
+            name_words.append('verification')
+    
+    # Create name
+    if name_words:
+        name = ' '.join(name_words).title()
+        return f"{name} Template"
+    else:
+        return "New Template"
+
+async def _auto_name_session_if_needed(db: AsyncSession, user_id: str, session_id: str, message: str, category: str = None):
+    """Automatically name a session based on the first message if no name is set"""
+    if not user_id:
+        return
+        
+    from sqlalchemy import select, update
+    
+    # Check if session already has a name
+    user_session_result = await db.execute(
+        select(UserSession).where(
+            UserSession.user_id == user_id,
+            UserSession.session_id == session_id
+        )
+    )
+    user_session = user_session_result.scalar_one_or_none()
+    
+    if user_session and not user_session.session_name:
+        # Generate name from message
+        auto_name = _generate_session_name_from_message(message, category)
+        
+        # Update session name
+        await db.execute(
+            update(UserSession)
+            .where(UserSession.user_id == user_id, UserSession.session_id == session_id)
+            .values(session_name=auto_name)
+        )
 
 # --- CORS for web UI ---
 app.add_middleware(
@@ -46,8 +140,12 @@ async def on_startup():
     except Exception:
         pass
 
-    async with engine.begin() as aconn:
-        await aconn.run_sync(Base.metadata.create_all)
+    try:
+        async with engine.begin() as aconn:
+            await aconn.run_sync(Base.metadata.create_all)
+    except Exception as e:
+        print(f"[WARNING] Table creation failed, probably already exist: {e}")
+        # Tables might already exist, continue anyway
         try:
             if engine.url.drivername.startswith("sqlite"):
                 await aconn.exec_driver_sql("PRAGMA journal_mode=WAL;")
@@ -388,11 +486,208 @@ async def config_reload():
     cfg = reload_config()
     return {"ok": True, "model": cfg.get("model")}
 
+# ---------- User Management Endpoints ----------
+
+@app.post("/users", response_model=UserResponse)
+async def create_user(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
+    """
+    Create a new user with user_id and password.
+    In production, password should be hashed.
+    """
+    from sqlalchemy import select
+    
+    # Check if user already exists
+    result = await db.execute(select(User).where(User.user_id == user_data.user_id))
+    existing_user = result.scalar_one_or_none()
+    
+    if existing_user:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="User already exists")
+    
+    # Create new user (in production, hash the password)
+    new_user = User(
+        user_id=user_data.user_id,
+        password=user_data.password  # TODO: Hash password in production
+    )
+    
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_user)
+    
+    return UserResponse(
+        user_id=new_user.user_id,
+        created_at=new_user.created_at.isoformat(),
+        updated_at=new_user.updated_at.isoformat()
+    )
+
+@app.post("/users/login")
+async def login_user(login_data: UserLogin, db: AsyncSession = Depends(get_db)):
+    """
+    Authenticate user with user_id and password.
+    Returns user info if credentials are valid.
+    """
+    from sqlalchemy import select
+    from fastapi import HTTPException
+    
+    # Find user
+    result = await db.execute(select(User).where(User.user_id == login_data.user_id))
+    user = result.scalar_one_or_none()
+    
+    if not user or user.password != login_data.password:  # TODO: Use proper password hashing
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    return {
+        "user_id": user.user_id,
+        "message": "Login successful",
+        "created_at": user.created_at.isoformat(),
+        "updated_at": user.updated_at.isoformat()
+    }
+
+@app.get("/users/{user_id}/sessions", response_model=UserSessionsResponse)
+async def get_user_sessions(user_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Get all sessions created by a specific user, ordered by update time (newest first).
+    """
+    from sqlalchemy import select, func, desc
+    from fastapi import HTTPException
+    
+    # Verify user exists
+    user_result = await db.execute(select(User).where(User.user_id == user_id))
+    user = user_result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Get all user sessions with session details
+    query = select(
+        UserSession.session_id,
+        UserSession.session_name,
+        UserSession.created_at,
+        UserSession.updated_at,
+        DBSession.data,
+        DBSession.updated_at.label('session_last_activity')
+    ).select_from(
+        UserSession.__table__.join(DBSession, UserSession.session_id == DBSession.id)
+    ).where(
+        UserSession.user_id == user_id
+    ).order_by(desc(UserSession.updated_at))
+    
+    result = await db.execute(query)
+    sessions_data = result.fetchall()
+    
+    sessions = []
+    for session_data in sessions_data:
+        # Count messages in session
+        messages = session_data.data.get("messages", []) if session_data.data else []
+        message_count = len(messages)
+        
+        sessions.append(UserSessionInfo(
+            session_id=session_data.session_id,
+            session_name=session_data.session_name,
+            created_at=session_data.created_at.isoformat(),
+            updated_at=session_data.updated_at.isoformat(),
+            message_count=message_count,
+            last_activity=session_data.session_last_activity.isoformat() if session_data.session_last_activity else session_data.updated_at.isoformat()
+        ))
+    
+    return UserSessionsResponse(
+        user_id=user_id,
+        sessions=sessions,
+        total_sessions=len(sessions)
+    )
+
+@app.put("/users/{user_id}/sessions/{session_id}/name")
+async def update_session_name(user_id: str, session_id: str, session_name: str, db: AsyncSession = Depends(get_db)):
+    """
+    Update the name/title of a user session for display purposes.
+    """
+    from sqlalchemy import select, update
+    from fastapi import HTTPException
+    
+    # Find the user session
+    result = await db.execute(
+        select(UserSession).where(
+            UserSession.user_id == user_id,
+            UserSession.session_id == session_id
+        )
+    )
+    user_session = result.scalar_one_or_none()
+    
+    if not user_session:
+        raise HTTPException(status_code=404, detail="Session not found for this user")
+    
+    # Update session name
+    await db.execute(
+        update(UserSession)
+        .where(UserSession.user_id == user_id, UserSession.session_id == session_id)
+        .values(session_name=session_name)
+    )
+    await db.commit()
+    
+    return {"message": "Session name updated successfully", "session_name": session_name}
+
 @app.get("/session/new")
-async def new_session(db: AsyncSession = Depends(get_db)):
+async def new_session_get(user_id: str = None, db: AsyncSession = Depends(get_db)):
+    """
+    Create a new session (GET method for backward compatibility).
+    If user_id is provided, the session will be linked to that user.
+    """
     s = await get_or_create_session(db, None)
+    
+    # If user_id is provided, create user session association
+    if user_id:
+        from sqlalchemy import select
+        
+        # Verify user exists
+        user_result = await db.execute(select(User).where(User.user_id == user_id))
+        user = user_result.scalar_one_or_none()
+        
+        if user:
+            # Create user session association
+            user_session = UserSession(
+                user_id=user_id,
+                session_id=s.id,
+                session_name=None  # Can be set later
+            )
+            db.add(user_session)
+    
     await db.commit()
     return {"session_id": s.id}
+
+@app.post("/session/new", response_model=SessionCreateResponse)
+async def new_session_post(session_data: SessionCreate, db: AsyncSession = Depends(get_db)):
+    """
+    Create a new session with optional name and user association.
+    Allows users to provide a meaningful name like 'Diwali Template Creation'.
+    """
+    s = await get_or_create_session(db, None)
+    
+    session_name = session_data.session_name
+    user_id = session_data.user_id
+    
+    # If user_id is provided, create user session association
+    if user_id:
+        from sqlalchemy import select
+        
+        # Verify user exists
+        user_result = await db.execute(select(User).where(User.user_id == user_id))
+        user = user_result.scalar_one_or_none()
+        
+        if user:
+            # Create user session association with the provided name
+            user_session = UserSession(
+                user_id=user_id,
+                session_id=s.id,
+                session_name=session_name
+            )
+            db.add(user_session)
+    
+    await db.commit()
+    return SessionCreateResponse(
+        session_id=s.id,
+        session_name=session_name,
+        user_id=user_id
+    )
 
 @app.get("/session/{session_id}", response_model=SessionData)
 async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
@@ -526,6 +821,12 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
     memory["_user_intent"] = user_intent
     s.memory = memory
 
+    # Auto-name session if this is the first message and user_id is provided
+    if inp.user_id and len(msgs) == 0:
+        # This is the first message - auto-generate a name
+        category = memory.get("category") or draft.get("category")
+        await _auto_name_session_if_needed(db, inp.user_id, s.id, safe_message, category)
+
     llm = LlmClient(model=cfg.get("model", "gpt-4o-mini"),
                     temperature=float(cfg.get("temperature", 0.2)))
 
@@ -598,11 +899,14 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         
         final_reply = reply or _targeted_missing_reply(missing)
 
-        s.data = {**(s.data or {}), "messages": _append_history(inp.message, final_reply)}
-        await upsert_session(db, s); await db.commit()
-
-        return ChatResponse(session_id=s.id, reply=final_reply,
-                            draft=merged, missing=missing, final_creation_payload=None)
+    s.data = {**(s.data or {}), "messages": _append_history(inp.message, final_reply)}
+    
+    # Update user session if this session is associated with a user
+    await _update_user_session_if_needed(db, inp.user_id, s.id)
+    
+    await upsert_session(db, s); await db.commit()
+    return ChatResponse(session_id=s.id, reply=final_reply,
+                        draft=merged, missing=missing, final_creation_payload=None)
 
     # 6) FINAL → sanitize -> validate -> persist (also enforce requested extras)
     if action == "FINAL":
@@ -631,6 +935,7 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
             s.last_action = "ASK"
             ask = _targeted_missing_reply(missing_extras)
             s.data = {**(s.data or {}), "messages": _append_history(inp.message, ask)}
+            await _update_user_session_if_needed(db, inp.user_id, s.id)
             await upsert_session(db, s); await db.commit()
             return ChatResponse(
                 session_id=s.id,
@@ -649,6 +954,7 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
             s.last_action = "ASK"
             final_reply = (reply + ("\n\nPlease fix: " + "; ".join(issues) if issues else "")).strip()
             s.data = {**(s.data or {}), "messages": _append_history(inp.message, final_reply)}
+            await _update_user_session_if_needed(db, inp.user_id, s.id)
             await upsert_session(db, s); await db.commit()
             return ChatResponse(session_id=s.id, reply=final_reply, draft=d.draft,
                                 missing=_compute_missing(d.draft, memory) + ["fix_validation_issues"],
@@ -659,6 +965,7 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         d.draft = candidate
         s.last_action = "FINAL"
         s.data = {**(s.data or {}), "messages": _append_history(inp.message, reply or "Finalized.")}
+        await _update_user_session_if_needed(db, inp.user_id, s.id)
         await upsert_session(db, s); await db.commit()
         return ChatResponse(session_id=s.id, reply=reply or "Finalized.",
                             draft=d.draft, missing=None, final_creation_payload=candidate)

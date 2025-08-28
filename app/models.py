@@ -10,6 +10,65 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    # UUID-as-string for user ID
+    user_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    
+    # Password - in production, this should be hashed
+    password: Mapped[str] = mapped_column(String(255), nullable=False)
+    
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class UserSession(Base):
+    __tablename__ = "user_sessions"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    
+    # Foreign key to users table
+    user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    
+    # Foreign key to sessions table
+    session_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    
+    # Optional session name/title for display
+    session_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
 class Session(Base):
     __tablename__ = "sessions"
 
@@ -97,3 +156,7 @@ class LlmLog(Base):
 Index("ix_sessions_updated_at", Session.updated_at)
 Index("ix_drafts_session_created_at", Draft.session_id, Draft.created_at)
 Index("ix_llm_logs_session_ts", LlmLog.session_id, LlmLog.ts)
+Index("ix_user_sessions_user_id", UserSession.user_id)
+Index("ix_user_sessions_updated_at", UserSession.updated_at)
+Index("ix_user_sessions_user_id", UserSession.user_id)
+Index("ix_user_sessions_session_id", UserSession.session_id)

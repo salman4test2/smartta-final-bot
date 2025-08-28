@@ -2,9 +2,47 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel
 
+# User management schemas
+class UserCreate(BaseModel):
+    user_id: str
+    password: str
+
+class UserResponse(BaseModel):
+    user_id: str
+    created_at: str
+    updated_at: str
+
+class UserLogin(BaseModel):
+    user_id: str
+    password: str
+
+class UserSessionInfo(BaseModel):
+    session_id: str
+    session_name: Optional[str] = None
+    created_at: str
+    updated_at: str
+    message_count: int
+    last_activity: str
+
+class UserSessionsResponse(BaseModel):
+    user_id: str
+    sessions: List[UserSessionInfo]
+    total_sessions: int
+
+class SessionCreate(BaseModel):
+    user_id: Optional[str] = None
+    session_name: Optional[str] = None
+
+class SessionCreateResponse(BaseModel):
+    session_id: str
+    session_name: Optional[str] = None
+    user_id: Optional[str] = None
+
+# Chat and session schemas
 class ChatInput(BaseModel):
     message: str
     session_id: Optional[str] = None
+    user_id: Optional[str] = None  # Add user_id support
 
 class ChatResponse(BaseModel):
     session_id: str

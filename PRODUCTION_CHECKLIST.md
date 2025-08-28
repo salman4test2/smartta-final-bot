@@ -30,6 +30,20 @@
 - [x] `GET /session/{id}/debug` - **NEW!** Complete session debug data
 - [x] `GET /health` - System health monitoring
 
+### 👤 User Management System (NEW!)
+- [x] **User Registration** - `POST /users` - Create new user accounts
+- [x] **User Authentication** - `POST /users/login` - Validate credentials
+- [x] **Session Association** - Link sessions to users automatically
+- [x] **User Session List** - `GET /users/{user_id}/sessions` - All sessions by user
+- [x] **Session Management** - `PUT /users/{user_id}/sessions/{session_id}/name` - Update session names
+- [x] **Activity Tracking** - Automatic timestamp updates on chat messages
+- [x] **Ordered by Activity** - Sessions sorted by most recent activity
+
+#### User Tables
+- [x] **users** - Store user credentials (user_id, password, timestamps)
+- [x] **user_sessions** - Map users to sessions with activity tracking
+- [x] **Database indexes** - Optimized queries for user and session lookup
+
 ### 🔍 Debug Endpoint Features
 - [x] **Complete conversation history** - All user messages and agent replies
 - [x] **LLM request/response logs** - Full OpenAI API call details with latency
