@@ -1,38 +1,33 @@
 from __future__ import annotations
-import os, hashlib
-from pathlib import Path
+import os, yaml, threading
 from typing import Any, Dict
-import yaml
 
-_DEFAULT_CFG: Dict[str, Any] = {
-    "model": os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-    "temperature": float(os.getenv("LLM_TEMPERATURE", "0.2")),
-    "history": {"mode": "all", "max_turns": 200, "log_llm_io": True},
-}
+_CONFIG = None
+_LOCK = threading.Lock()
 
-CFG_PATH = os.getenv("CONFIG_PATH", "./config/whatsapp.yaml")
-
-_cache: Dict[str, Any] = {"cfg": _DEFAULT_CFG, "cksum": ""}
-
-def load_config() -> Dict[str, Any]:
-    path = Path(CFG_PATH)
-    if not path.exists():
-        return _DEFAULT_CFG
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    cfg = {**_DEFAULT_CFG, **data}
-    return cfg
-
-def checksum() -> str:
+def _load():
+    path = os.getenv("CONFIG_PATH", "./config/whatsapp.yaml")
     try:
-        b = Path(CFG_PATH).read_bytes()
-    except Exception:
-        return ""
-    import hashlib as _h
-    return _h.sha256(b).hexdigest()
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        data = {}  # Graceful fallback if config missing
+    except yaml.YAMLError as e:
+        print(f"Warning: Invalid YAML in {path}: {e}")
+        data = {}
+    
+    # sane defaults (align with your YAML)
+    data.setdefault("model", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    data.setdefault("temperature", float(os.getenv("LLM_TEMPERATURE", "0.2")))
+    data.setdefault("history", {"mode": "all", "max_turns": 200, "log_llm_io": True})
+    return data
 
 def get_config(force: bool = False) -> Dict[str, Any]:
-    cks = checksum()
-    if force or cks != _cache.get("cksum"):
-        _cache["cfg"] = load_config()
-        _cache["cksum"] = cks
-    return _cache["cfg"]
+    global _CONFIG
+    with _LOCK:
+        if force or _CONFIG is None:
+            _CONFIG = _load()
+        return _CONFIG
+
+def reload_config() -> Dict[str, Any]:
+    return get_config(force=True)

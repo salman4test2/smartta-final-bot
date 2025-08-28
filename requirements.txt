@@ -2,9 +2,10 @@ fastapi
 uvicorn[standard]
 pydantic
 sqlalchemy[asyncio]
-asyncpg
+psycopg[binary,pool]
 aiosqlite
 tenacity
 PyYAML
 jsonschema
 openai>=1.40.0
+python-dotenv

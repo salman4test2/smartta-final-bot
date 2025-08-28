@@ -65,6 +65,12 @@ lint_rules:
     max_url: 2
     max_phone: 1
 
+  # Language and naming constraints
+  languages:
+    whitelist: [en_US, hi_IN, es_MX, fr_FR, de_DE]   # extend as needed
+  naming:
+    reserved_prefixes: [test_, tmp_, demo_]          # optional, configurable
+
   # Category-specific constraints
   category_constraints:
     AUTHENTICATION:

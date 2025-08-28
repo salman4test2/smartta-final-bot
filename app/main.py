@@ -11,14 +11,19 @@ import datetime as dt
 from .db import engine, SessionLocal, Base
 from .models import Session as DBSession, Draft
 from .repo import get_or_create_session, upsert_session, create_draft, log_llm
-from .config import get_config
+from .config import get_config, reload_config
 from .prompts import build_system_prompt, build_context_block
 from .llm import LlmClient
 from .validator import validate_schema, lint_rules
-from .schemas import ChatInput, ChatResponse
+from .schemas import ChatInput, ChatResponse, SessionData, ChatMessage, SessionDebugData, LLMLogEntry
 from .utils import merge_deep
 
 app = FastAPI(title="LLM-First WhatsApp Template Builder", version="4.0.0")
+
+import hashlib
+
+def _qhash(s: str) -> str:
+    return hashlib.sha1((s or "").encode("utf-8")).hexdigest()[:12]
 
 # --- CORS for web UI ---
 app.add_middleware(
@@ -51,7 +56,26 @@ async def on_startup():
         except Exception:
             pass
 
-# ---------- Helpers (module-level so they exist before use) ----------
+# ---------- Helpers ----------
+
+LANG_MAP = {
+    "english": "en_US", "en": "en_US", "en_us": "en_US",
+    "hindi": "hi_IN", "hi": "hi_IN", "hi_in": "hi_IN",
+    "spanish": "es_MX", "es": "es_MX", "es_mx": "es_MX",
+}
+
+def _normalize_language(s: str | None) -> str | None:
+    if not s:
+        return None
+    key = s.strip().lower().replace("-", "_").replace(" ", "")
+    return LANG_MAP.get(key, s if "_" in s else None)
+
+def _is_affirmation(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return any(t == w or t.startswith(w) for w in [
+        "yes","y","ok","okay","sure","sounds good","go ahead",
+        "please proceed","proceed","confirm","finalize","do it"
+    ])
 
 def _sanitize_user_input(text: str) -> str:
     if not isinstance(text, str):
@@ -94,8 +118,10 @@ def _determine_conversation_state(draft: Dict[str, Any], memory: Dict[str, Any])
     has_category = bool(draft.get("category") or memory.get("category"))
     has_language = bool(draft.get("language") or memory.get("language_pref"))
     has_name = bool(draft.get("name"))
-    has_body = any(c.get("type") == "BODY" and (c.get("text") or "").strip()
-                   for c in (draft.get("components") or []))
+    has_body = any(
+        isinstance(c, dict) and c.get("type") == "BODY" and (c.get("text") or "").strip()
+        for c in (draft.get("components") or [])
+    )
     if not has_category:
         return "need_category"
     if not has_language:
@@ -126,21 +152,65 @@ def _validate_llm_response(response: Dict[str, Any]) -> Dict[str, Any]:
     if response["agent_action"] not in {"ASK","DRAFT","UPDATE","FINAL","CHITCHAT"}:
         response["agent_action"] = "ASK"
 
+    def _has_body(d: Dict[str, Any]) -> bool:
+        for comp in (d.get("components") or []):
+            if isinstance(comp, dict) and comp.get("type") == "BODY" and (comp.get("text") or "").strip():
+                return True
+        return False
+
+    # Only validate FINAL action payloads, trust LLM for other actions
     if response["agent_action"] == "FINAL":
         draft = response.get("final_creation_payload") or response.get("draft") or {}
-        required = ["name","language","category","components"]
-        if not all(draft.get(k) for k in required):
+        required = ["name", "language", "category"]
+        missing_fields = [k for k in required if not draft.get(k)]
+        if not _has_body(draft):
+            missing_fields.append("body")
+
+        # Only downgrade to ASK if truly missing critical fields
+        if missing_fields:
             response["agent_action"] = "ASK"
-            response["message_to_user"] = "I need a bit more information before finalizing."
+            response["missing"] = missing_fields
+            response["message_to_user"] = f"I still need: {', '.join(missing_fields)}. Please provide them to complete the template."
+    
+    # For non-FINAL actions, trust the LLM's missing calculation completely
+    # Don't override what the LLM determined
     return response
+
+def _slug(s_: str) -> str:
+    s_ = (s_ or "").lower().strip()
+    s_ = re.sub(r"[^a-z0-9_]+", "_", s_)
+    return (re.sub(r"_+", "_", s_).strip("_") or "template")[:64]
 
 def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(cand, dict):
         return {}
     c = dict(cand)
+
+    # strip leaked policy keys if model echoed them
+    for k in ("required","component_types","button_types","body_required"):
+        c.pop(k, None)
+
+    # Auto-convert name to snake_case if it doesn't match pattern
+    pattern = re.compile(r"^[a-z0-9_]{1,64}$")
+    if "name" in c and isinstance(c["name"], str) and c["name"].strip():
+        nm = c["name"].strip()
+        if not pattern.match(nm):
+            c["name"] = _slug(nm)
+        else:
+            c["name"] = nm
+    if "language" in c:
+        lang = _normalize_language(c.get("language"))
+        if lang:
+            c["language"] = lang
+        else:
+            c.pop("language", None)
+
+    # drop blank strings
     for k in ("name","language","category"):
         if k in c and isinstance(c[k], str) and not c[k].strip():
             c.pop(k, None)
+
+    # components clean
     comps = c.get("components")
     if isinstance(comps, list):
         clean = []
@@ -158,15 +228,11 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
             elif t == "HEADER":
                 fmt = (comp.get("format") or "").strip().upper()
                 txt = (comp.get("text") or "").strip()
-
-                # If model gave header text but omitted format, default to TEXT
                 if not fmt and txt:
                     fmt = "TEXT"
-
                 if fmt == "TEXT" and txt:
                     clean.append({"type": "HEADER", "format": "TEXT", "text": txt})
-                elif fmt in {"IMAGE", "VIDEO", "DOCUMENT", "LOCATION"}:
-                    # keep media/location slot even without example; preview can show placeholder
+                elif fmt in {"IMAGE","VIDEO","DOCUMENT","LOCATION"}:
                     item = {"type": "HEADER", "format": fmt}
                     if "example" in comp:
                         item["example"] = comp["example"]
@@ -209,15 +275,12 @@ def _compute_missing(p: Dict[str, Any], memory: Dict[str, Any]) -> List[str]:
     if not p.get("category"): miss.append("category")
     if not p.get("language"): miss.append("language")
     if not p.get("name"):     miss.append("name")
-
     comps = p.get("components") or []
     has_body = any(
         isinstance(c, dict) and (c.get("type") or "").upper() == "BODY" and (c.get("text") or "").strip()
         for c in comps
     )
     if not has_body: miss.append("body")
-
-    # If user explicitly asked for extras, require them before FINAL
     if memory.get("wants_header") and not _has_component(p, "HEADER"):
         miss.append("header")
     if memory.get("wants_footer") and not _has_component(p, "FOOTER"):
@@ -225,11 +288,6 @@ def _compute_missing(p: Dict[str, Any], memory: Dict[str, Any]) -> List[str]:
     if memory.get("wants_buttons") and not _has_component(p, "BUTTONS"):
         miss.append("buttons")
     return miss
-
-def _slug(s_: str) -> str:
-    s_ = (s_ or "").lower().strip()
-    s_ = re.sub(r"[^a-z0-9_]+", "_", s_)
-    return re.sub(r"_+", "_", s_).strip("_") or "template"
 
 def _minimal_scaffold(mem: Dict[str, Any]) -> Dict[str, Any]:
     cat = (mem.get("category") or "").upper()
@@ -240,12 +298,10 @@ def _minimal_scaffold(mem: Dict[str, Any]) -> Dict[str, Any]:
     business = mem.get("business_type") or mem.get("business") or "brand"
     name = mem.get("proposed_name") or f"{_slug(event)}_{_slug(business)}_v{dt.datetime.utcnow().strftime('%m%d')}"
     components: List[Dict[str, Any]] = []
-
     if cat == "AUTHENTICATION":
         body = "{{1}} is your verification code. Do not share this code. It expires in {{2}} minutes."
         components.append({"type":"BODY","text":body})
         return {"category":cat,"language":lang,"name":name,"components":components}
-
     body = "Hi {{1}}, {event}! Enjoy {{2}}.".format(event=event)
     if cat == "UTILITY":
         body = "Hello {{1}}, your {{2}} has been updated. Latest status: {{3}}."
@@ -263,16 +319,61 @@ def _fallback_reply_for_state(state: str) -> str:
         return "What should the main message (BODY) say?"
     return "Could you please rephrase what you want to create?"
 
-def _has_extras_components(p: Dict[str, Any]) -> bool:
-    comps = (p or {}).get("components") or []
-    return any(isinstance(c, dict) and c.get("type") in {"HEADER","FOOTER","BUTTONS"} for c in comps)
-
 def _user_declined_extras(msg: str) -> bool:
     t = (msg or "").lower()
     return any(phrase in t for phrase in [
         "skip", "no buttons", "no header", "no footer",
         "finalize as is", "looks good as is", "no extras"
     ])
+
+def _auto_apply_extras_on_yes(user_text: str, candidate: Dict[str, Any], memory: Dict[str, Any]) -> Dict[str, Any]:
+    """If user affirms and they asked for extras, auto-add compliant components."""
+    if not _is_affirmation(user_text):
+        return candidate or {}
+    cand = dict(candidate or {})
+    comps = list((cand.get("components") or []))
+
+    def has(kind: str) -> bool:
+        return any(isinstance(c, dict) and (c.get("type") or "").upper() == kind for c in comps)
+
+    changed = False
+    if memory.get("wants_header") and not has("HEADER"):
+        hdr = (memory.get("event_label") or "Special offer just for you!")[:60]
+        comps.insert(0, {"type": "HEADER", "format": "TEXT", "text": hdr})
+        changed = True
+    if memory.get("wants_footer") and not has("FOOTER"):
+        comps.append({"type":"FOOTER","text":"Thank you!"})
+        changed = True
+    if memory.get("wants_buttons") and not has("BUTTONS"):
+        comps.append({
+            "type":"BUTTONS",
+            "buttons":[
+                {"type":"QUICK_REPLY","text":"View offers"},
+                {"type":"QUICK_REPLY","text":"Order now"}
+            ]
+        })
+        changed = True
+    if changed:
+        cand["components"] = comps
+    return cand
+
+def _targeted_missing_reply(missing: List[str]) -> str:
+    # Pick the highest-priority missing slot and ask a focused question
+    if "language" in missing:
+        return "Great so far. Which language code should I use (e.g., en_US, hi_IN)?"
+    if "name" in missing:
+        return "What should we name this template? Use snake_case (e.g., diwali_sweets_offer)."
+    if "body" in missing:
+        return "What should the main message (BODY) say? If you want, I can write it for you."
+    if "category" in missing:
+        return "Which template category should I use: MARKETING, UTILITY, or AUTHENTICATION?"
+    if "header" in missing:
+        return "You asked for a header. Should I add a short TEXT header like 'Festive offer just for you!'?"
+    if "buttons" in missing:
+        return "You asked for buttons. Should I add two quick replies like 'View offers' and 'Order now'?"
+    if "footer" in missing:
+        return "You asked for a footer. Should I add a short footer like 'Thank you!'?"
+    return "What would you like me to add next?"
 
 # ---------- Endpoints ----------
 
@@ -281,17 +382,108 @@ async def health():
     cfg = get_config()
     return {"status": "ok", "model": cfg.get("model"), "db": "ok"}
 
+@app.post("/config/reload")
+async def config_reload():
+    """Reload configuration from disk"""
+    cfg = reload_config()
+    return {"ok": True, "model": cfg.get("model")}
+
 @app.get("/session/new")
 async def new_session(db: AsyncSession = Depends(get_db)):
     s = await get_or_create_session(db, None)
     await db.commit()
     return {"session_id": s.id}
 
+@app.get("/session/{session_id}", response_model=SessionData)
+async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Retrieve session data including chat history for UI integration.
+    Returns messages in chronological order for chat UI display.
+    """
+    s = await get_or_create_session(db, session_id)
+    
+    # Get current draft
+    current_draft = {}
+    if s.active_draft_id:
+        draft = await db.get(Draft, s.active_draft_id)
+        if draft:
+            current_draft = draft.draft or {}
+    
+    # Extract messages
+    messages_data = (s.data or {}).get("messages", [])
+    messages = [ChatMessage(role=msg["role"], content=msg["content"]) for msg in messages_data]
+    
+    return SessionData(
+        session_id=s.id,
+        messages=messages,
+        draft=current_draft,
+        memory=s.memory or {},
+        last_action=s.last_action,
+        updated_at=s.updated_at.isoformat() if s.updated_at else ""
+    )
+
+@app.get("/session/{session_id}/debug", response_model=SessionDebugData)
+async def get_session_debug(session_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Debug endpoint: Get complete session data including LLM request/response logs.
+    Provides detailed information for troubleshooting and development.
+    """
+    from sqlalchemy import text
+    
+    s = await get_or_create_session(db, session_id)
+    
+    # Get current draft
+    current_draft = {}
+    if s.active_draft_id:
+        draft = await db.get(Draft, s.active_draft_id)
+        if draft:
+            current_draft = draft.draft or {}
+    
+    # Extract messages
+    messages_data = (s.data or {}).get("messages", [])
+    messages = [ChatMessage(role=msg["role"], content=msg["content"]) for msg in messages_data]
+    
+    # Get LLM logs for this session
+    result = await db.execute(text("""
+        SELECT direction, payload, model, latency_ms, ts
+        FROM llm_logs 
+        WHERE session_id = :session_id 
+        ORDER BY ts ASC
+    """), {"session_id": session_id})
+    
+    llm_logs = []
+    for log in result.fetchall():
+        llm_logs.append(LLMLogEntry(
+            timestamp=log[4].isoformat() if log[4] else "",
+            direction=log[0],
+            payload=log[1] or {},
+            model=log[2],
+            latency_ms=log[3]
+        ))
+    
+    # Session info for debugging
+    session_info = {
+        "id": s.id,
+        "active_draft_id": s.active_draft_id,
+        "last_question_hash": s.last_question_hash,
+        "created_at": s.updated_at.isoformat() if s.updated_at else "",
+        "total_messages": len(messages),
+        "total_llm_calls": len(llm_logs)
+    }
+    
+    return SessionDebugData(
+        session_id=s.id,
+        session_info=session_info,
+        messages=messages,
+        current_draft=current_draft,
+        memory=s.memory or {},
+        llm_logs=llm_logs,
+        last_action=s.last_action,
+        updated_at=s.updated_at.isoformat() if s.updated_at else ""
+    )
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
-    """
-    Production-ready WhatsApp Template Builder with comprehensive error handling.
-    """
     cfg = get_config()
     hist_cfg = cfg.get("history", {}) or {}
     max_turns = int(hist_cfg.get("max_turns", 200))
@@ -317,7 +509,8 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
     system = build_system_prompt(cfg)
     context = build_context_block(draft, memory, cfg, msgs)
     safe_message = _sanitize_user_input(inp.message)
-    # Track explicit requests so we can block FINAL until they exist
+
+    # Track explicit extras requests so we block FINAL until they exist
     lower_msg = safe_message.lower()
     if "header" in lower_msg:
         memory["wants_header"] = True
@@ -345,7 +538,7 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
                       cfg.get("model"), None)
         fallback = _fallback_reply_for_state(current_state)
         return ChatResponse(session_id=s.id, reply=fallback,
-                            draft=draft, missing=_compute_missing(draft),
+                            draft=draft, missing=_compute_missing(draft, memory),
                             final_creation_payload=None)
 
     # logs
@@ -367,40 +560,57 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         memory = merge_deep(memory, {"extras_choice": "skip"})
         s.memory = memory
 
-    # local helpers
+    # local history helper
     def _append_history(user_text: str, assistant_text: str) -> List[Dict[str, str]]:
         new_hist = msgs + [{"role": "user", "content": user_text},
                            {"role": "assistant", "content": assistant_text}]
         return new_hist[-max_turns:]
 
-    # ------------------- 5) Let the LLM drive category inference -------------------
+    # 4) Let LLM drive category; don't inject server question
     category = (candidate.get("category") or memory.get("category") or draft.get("category"))
     if category and not memory.get("category"):
         s.memory = merge_deep(memory, {"category": category})
 
-    # If category is still absent, DO NOT inject a server-side category question.
-    # Trust the LLM's reply to either ask one clarifying question or to infer on its own.
-    # We simply continue to the action handling below.
-
-    # 6) Non-FINAL → merge sanitized candidate
+    # 5) Non-FINAL → merge sanitized candidate (with extras auto-apply on "yes")
     if action in {"ASK","DRAFT","UPDATE","CHITCHAT"}:
+        candidate = _auto_apply_extras_on_yes(safe_message, candidate, memory)
         cand_clean = _sanitize_candidate(candidate) if candidate else {}
         merged = merge_deep(draft, cand_clean) if cand_clean else draft
 
+        # if language still missing, try to normalize from user text like "english"
+        if not merged.get("language"):
+            lang_guess = _normalize_language(safe_message)
+            if lang_guess:
+                merged["language"] = lang_guess
+
         d.draft = merged
         s.last_action = action
-        s.data = {**(s.data or {}), "messages": _append_history(inp.message, reply or "What should I add next?")}
+
+        # Trust LLM's missing calculation, but supplement with any obvious gaps
+        llm_missing = out.get("missing") or []
+        computed_missing = _compute_missing(merged, memory)
+        
+        # Use LLM missing as primary, only add computed missing if LLM missed something obvious
+        missing = llm_missing[:]
+        for item in computed_missing:
+            if item not in missing and item in ["category", "language", "name", "body"]:
+                missing.append(item)
+        
+        final_reply = reply or _targeted_missing_reply(missing)
+
+        s.data = {**(s.data or {}), "messages": _append_history(inp.message, final_reply)}
         await upsert_session(db, s); await db.commit()
 
-        missing = out.get("missing") or _compute_missing(merged, memory)
-        return ChatResponse(session_id=s.id, reply=reply or "What should I add next?",
+        return ChatResponse(session_id=s.id, reply=final_reply,
                             draft=merged, missing=missing, final_creation_payload=None)
 
-    # 7) FINAL → sanitize -> validate -> persist
+    # 6) FINAL → sanitize -> validate -> persist (also enforce requested extras)
     if action == "FINAL":
+        candidate = _auto_apply_extras_on_yes(safe_message, candidate, memory)
         cand_clean = _sanitize_candidate(candidate) if candidate else {}
         candidate = cand_clean or draft or _minimal_scaffold(memory)
 
+        # enforce extras if user asked for them but they are still missing
         def _has_component_kind(p: Dict[str, Any], kind: str) -> bool:
             return any(
                 isinstance(c, dict) and (c.get("type") or "").upper() == kind
@@ -416,14 +626,12 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
             missing_extras.append("buttons")
 
         if missing_extras:
+            # ask a single targeted question rather than finalize
             d.draft = merge_deep(draft, candidate)
             s.last_action = "ASK"
-            ask = "You asked for {}. Should I add them now? For header, I can add a TEXT header like “Festive offer just for you!” (≤60 chars).".format(
-                ", ".join(missing_extras)
-            )
+            ask = _targeted_missing_reply(missing_extras)
             s.data = {**(s.data or {}), "messages": _append_history(inp.message, ask)}
-            await upsert_session(db, s);
-            await db.commit()
+            await upsert_session(db, s); await db.commit()
             return ChatResponse(
                 session_id=s.id,
                 reply=ask,
@@ -443,7 +651,7 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
             s.data = {**(s.data or {}), "messages": _append_history(inp.message, final_reply)}
             await upsert_session(db, s); await db.commit()
             return ChatResponse(session_id=s.id, reply=final_reply, draft=d.draft,
-                                missing=(out.get("missing") or []) + ["fix_validation_issues"],
+                                missing=_compute_missing(d.draft, memory) + ["fix_validation_issues"],
                                 final_creation_payload=None)
 
         d.finalized_payload = candidate
@@ -455,12 +663,33 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         return ChatResponse(session_id=s.id, reply=reply or "Finalized.",
                             draft=d.draft, missing=None, final_creation_payload=candidate)
 
-    # 8) Fallback (treat as ASK)
+    # 7) Fallback (treat as ASK)
     final_draft = candidate or draft
     d.draft = final_draft
     s.last_action = "ASK"
-    s.data = {**(s.data or {}), "messages": _append_history(inp.message, reply or "What would you like me to help you create?")}
+    missing = _compute_missing(final_draft, memory)
+    final_reply = reply or _targeted_missing_reply(missing)
+    if final_reply.endswith("?"):
+        qh = _qhash(final_reply)
+        if s.last_question_hash == qh and _is_affirmation(safe_message):
+            # auto-apply extras and try to fill a single missing slot
+            merged = merge_deep(merged, _auto_apply_extras_on_yes(safe_message, {}, memory))
+            if "language" in missing:
+                guess = _normalize_language(safe_message) or memory.get("language_pref") or "en_US"
+                merged["language"] = guess
+            if "name" in missing and ("you choose" in safe_message.lower() or "suggest" in safe_message.lower()):
+                merged["name"] = _slug(memory.get("event_label") or "template")
+            if "body" in missing and "you choose" in safe_message.lower():
+                # keep it short & compliant; the LLM will refine next turn
+                merged.setdefault("components", []).insert(0, {"type": "BODY", "text": "Hi {{1}}, we have a special offer for you!"})
+            d.draft = merged
+            final_reply = _targeted_missing_reply(_compute_missing(merged, memory))
+        # store hash (or clear if not a question)
+        s.last_question_hash = qh
+    else:
+        s.last_question_hash = None # not a question      
+    s.data = {**(s.data or {}), "messages": _append_history(inp.message, final_reply)}
     await upsert_session(db, s); await db.commit()
-    return ChatResponse(session_id=s.id, reply=reply or "What would you like me to help you create?",
-                        draft=final_draft, missing = _compute_missing(final_draft, memory),
+    return ChatResponse(session_id=s.id, reply=final_reply,
+                        draft=final_draft, missing=missing,
                         final_creation_payload=None)
