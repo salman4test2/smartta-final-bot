@@ -31,3 +31,26 @@ def get_config(force: bool = False) -> Dict[str, Any]:
 
 def reload_config() -> Dict[str, Any]:
     return get_config(force=True)
+
+def get_cors_origins() -> list[str]:
+    """Get CORS origins based on environment"""
+    env = os.getenv("ENVIRONMENT", "development").lower()
+    
+    if env == "production":
+        # Production: Use specific allowed origins
+        origins = os.getenv("CORS_ORIGINS", "").split(",")
+        return [origin.strip() for origin in origins if origin.strip()]
+    elif env == "staging":
+        # Staging: More restrictive than dev but allow staging domains
+        return [
+            "http://localhost:3000",
+            "http://localhost:8080", 
+            "https://staging-domain.com"  # Replace with actual staging domain
+        ]
+    else:
+        # Development: Allow all origins for ease of development
+        return ["*"]
+
+def is_production() -> bool:
+    """Check if running in production environment"""
+    return os.getenv("ENVIRONMENT", "development").lower() == "production"

@@ -68,9 +68,10 @@ class UserSession(Base):
         nullable=False,
     )
     
-    # Prevent duplicate user-session associations
+    # Prevent duplicate user-session associations and optimize queries
     __table_args__ = (
         Index("idx_user_session_unique", "user_id", "session_id", unique=True),
+        Index("idx_user_sessions_updated_at", "updated_at"),  # For ordering by activity
     )
 
 

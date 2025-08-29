@@ -9,61 +9,89 @@ import re
 import datetime as dt
 
 from .db import engine, SessionLocal, Base
-from .models import Session as DBSession, Draft, User, UserSession
-from .repo import get_or_create_session, upsert_session, create_draft, log_llm
-from .config import get_config, reload_config
+from .models import Draft, User, UserSession
+from .repo import get_or_create_session, upsert_session, create_draft, log_llm, upsert_user_session, touch_user_session
+from .config import get_config, get_cors_origins, is_production
 from .prompts import build_system_prompt, build_context_block
+from .friendly_prompts import build_friendly_system_prompt, get_helpful_examples, get_encouragement_messages
 from .llm import LlmClient
 from .validator import validate_schema, lint_rules
-from .schemas import (
-    ChatInput, ChatResponse, SessionData, ChatMessage, SessionDebugData, LLMLogEntry,
-    UserCreate, UserResponse, UserLogin, UserSessionInfo, UserSessionsResponse,
-    SessionCreate, SessionCreateResponse
-)
-from .utils import merge_deep
+from .schemas import ChatInput, ChatResponse, SessionData, ChatMessage
+from .utils import merge_deep, scrub_sensitive_data
+
+# Import route modules
+from .routes import config, debug, users, sessions
 
 app = FastAPI(title="LLM-First WhatsApp Template Builder", version="4.0.0")
+
+# Include route modules
+app.include_router(config.router)
+app.include_router(debug.router)
+app.include_router(users.router)
+app.include_router(sessions.router)
 
 import hashlib
 
 def _qhash(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8")).hexdigest()[:12]
 
-async def _update_user_session_if_needed(db: AsyncSession, user_id: str, session_id: str):
-    """Helper function to update user session timestamp when user sends a message"""
-    if not user_id:
-        return
-        
-    from sqlalchemy import select, update, func
-    
-    # Check if user session association exists
-    user_session_result = await db.execute(
-        select(UserSession).where(
-            UserSession.user_id == user_id,
-            UserSession.session_id == session_id
-        )
-    )
-    user_session = user_session_result.scalar_one_or_none()
-    
-    if user_session:
-        # Update the user session timestamp
-        await db.execute(
-            update(UserSession)
-            .where(UserSession.user_id == user_id, UserSession.session_id == session_id)
-            .values(updated_at=func.now())
-        )
-    else:
-        # Create new user session association if it doesn't exist
-        new_user_session = UserSession(
-            user_id=user_id,
-            session_id=session_id,
-            session_name=None
-        )
-        db.add(new_user_session)
+def _redact_secrets(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Redact potentially sensitive information from log payloads"""
+    import copy, hashlib
+    if not isinstance(payload, dict):
+        return payload
+
+    redacted = copy.deepcopy(payload)
+
+    sensitive_keys = {
+        "password", "token", "api_key", "secret", "auth", "authorization",
+        "cookie", "phone", "email"
+    }
+    hash_keys = {"user_id", "session_id"}
+    preserve_keys = {"system", "context", "missing", "agent_action", "draft"}
+
+    def _hash(s): 
+        return hashlib.sha1(str(s).encode()).hexdigest()[:10]
+
+    def walk(obj, preserve_strings=False):
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                kl = k.lower()
+
+                # 1) hash ids for correlation
+                if any(hk in kl for hk in hash_keys):
+                    out[k] = f"[HASH:{_hash(v)}]"
+                    continue
+
+                # 2) redact secrets
+                if any(sens in kl for sens in sensitive_keys):
+                    out[k] = "[REDACTED]"
+                    continue
+
+                # 3) preserve keys (no truncation on strings)
+                if k in preserve_keys:
+                    # still recurse to redact nested secrets inside draft etc., but preserve strings
+                    out[k] = walk(v, preserve_strings=True)
+                    continue
+
+                out[k] = walk(v, preserve_strings=False)
+            return out
+
+        if isinstance(obj, list):
+            return [walk(x, preserve_strings) for x in obj]
+
+        if isinstance(obj, str):
+            if preserve_strings:
+                return obj  # Don't truncate strings in preserved keys
+            return obj if len(obj) <= 200 else obj[:100] + "...[TRUNCATED]"
+
+        return obj
+
+    return walk(redacted)
 
 def _generate_session_name_from_message(message: str, category: str = None) -> str:
     """Generate a meaningful session name from the first user message"""
-    import re
     
     # Clean the message
     clean_msg = re.sub(r'[^\w\s]', '', message.lower())
@@ -77,12 +105,13 @@ def _generate_session_name_from_message(message: str, category: str = None) -> s
     name_words = meaningful_words[:4] if len(meaningful_words) >= 4 else meaningful_words[:3]
     
     # Add category if available
-    if category and category != 'UNKNOWN':
-        if category == 'MARKETING':
+    cat = (category or '').upper()
+    if cat and cat != 'UNKNOWN':
+        if cat == 'MARKETING':
             name_words.append('promotion')
-        elif category == 'UTILITY':
+        elif cat == 'UTILITY':
             name_words.append('notification')
-        elif category == 'AUTHENTICATION':
+        elif cat == 'AUTHENTICATION':
             name_words.append('verification')
     
     # Create name
@@ -119,10 +148,10 @@ async def _auto_name_session_if_needed(db: AsyncSession, user_id: str, session_i
             .values(session_name=auto_name)
         )
 
-# --- CORS for web UI ---
+# --- CORS configuration based on environment ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten in prod if you have a fixed UI origin
+    allow_origins=get_cors_origins(),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -147,6 +176,10 @@ async def on_startup():
     # apply SQLite PRAGMAs (no-op on Postgres)
     try:
         if engine.url.drivername.startswith("sqlite"):
+            # Warn if using SQLite in production
+            if is_production():
+                print("[WARNING] Using SQLite in production environment. PostgreSQL is recommended for production deployments.")
+            
             async with engine.begin() as aconn:
                 await aconn.exec_driver_sql("PRAGMA journal_mode=WAL;")
                 await aconn.exec_driver_sql("PRAGMA synchronous=NORMAL;")
@@ -157,23 +190,25 @@ async def on_startup():
 # ---------- Helpers ----------
 
 LANG_MAP = {
-    "english": "en_US", "en": "en_US", "en_us": "en_US",
-    "hindi": "hi_IN", "hi": "hi_IN", "hi_in": "hi_IN",
-    "spanish": "es_MX", "es": "es_MX", "es_mx": "es_MX",
+    "english": "en_US", "en": "en_US", "en_us": "en_US", "english_us": "en_US",
+    "hindi": "hi_IN", "hi": "hi_IN", "hi_in": "hi_IN", "hindi_in": "hi_IN",
+    "spanish": "es_MX", "es": "es_MX", "es_mx": "es_MX", "spanish_mx": "es_MX",
 }
+
+AFFIRM_REGEX = re.compile(
+    r'^\s*(yes|y|ok|okay|sure|sounds\s+good|go\s+ahead|please\s+proceed|proceed|confirm|finalize|do\s+it)\b',
+    re.I
+)
 
 def _normalize_language(s: str | None) -> str | None:
     if not s:
         return None
-    key = s.strip().lower().replace("-", "_").replace(" ", "")
+    # Normalize key by removing non-alphanumeric chars except underscore
+    key = re.sub(r'[^a-z_]', '', s.strip().lower().replace("-", "_").replace(" ", "_"))
     return LANG_MAP.get(key, s if "_" in s else None)
 
 def _is_affirmation(text: str) -> bool:
-    t = (text or "").strip().lower()
-    return any(t == w or t.startswith(w) for w in [
-        "yes","y","ok","okay","sure","sounds good","go ahead",
-        "please proceed","proceed","confirm","finalize","do it"
-    ])
+    return bool(AFFIRM_REGEX.match(text or ""))
 
 def _sanitize_user_input(text: str) -> str:
     if not isinstance(text, str):
@@ -181,6 +216,8 @@ def _sanitize_user_input(text: str) -> str:
     text = text.strip()
     if len(text) > 2000:
         text = text[:2000]
+    
+    # Remove potentially harmful patterns (keep data intact for LLM processing)
     for pattern in [
         r"(?i)system\s*:",
         r"(?i)assistant\s*:",
@@ -193,24 +230,56 @@ def _sanitize_user_input(text: str) -> str:
     return text.strip()
 
 def _classify_user_intent(message: str, current_state: str) -> str:
+    """Enhanced intent classification for laypeople using natural language."""
     msg = (message or "").lower()
-    if any(w in msg for w in ["marketing", "markting", "promo", "promotion", "offer"]):
-        return "category_marketing"
-    if any(w in msg for w in ["utility", "transactional", "update", "notification"]):
-        return "category_utility"
-    if any(w in msg for w in ["auth", "authentication", "otp", "verify", "verification"]):
-        return "category_auth"
-    if any(w in msg for w in ["english", "en_us", "spanish", "es_mx", "hindi", "hi_in"]):
+    
+    # Business goals and use cases (laypeople language)
+    if any(w in msg for w in ["discount", "sale", "offer", "promotion", "deal", "special", "coupon", "new product", "collection", "launch"]):
+        return "business_goal_promotional"
+    if any(w in msg for w in ["order", "confirm", "delivery", "shipping", "appointment", "reminder", "update", "status", "invoice", "payment"]):
+        return "business_goal_transactional"
+    if any(w in msg for w in ["welcome", "greeting", "new customer", "thank you", "birthday", "anniversary"]):
+        return "business_goal_relationship"
+    if any(w in msg for w in ["login", "password", "code", "verification", "otp", "security", "verify"]):
+        return "business_goal_security"
+    
+    # Business types (help categorize)
+    if any(w in msg for w in ["restaurant", "food", "cafe", "hotel", "booking"]):
+        return "business_type_hospitality"
+    if any(w in msg for w in ["shop", "store", "retail", "clothes", "shoes", "fashion"]):
+        return "business_type_retail"
+    if any(w in msg for w in ["doctor", "clinic", "appointment", "health", "medical"]):
+        return "business_type_healthcare"
+    if any(w in msg for w in ["salon", "beauty", "spa", "hair", "nails"]):
+        return "business_type_beauty"
+    
+    # Journey-specific intents
+    if any(w in msg for w in ["don't know", "not sure", "help me", "guide me", "you choose", "you decide"]):
+        return "needs_guidance"
+    if any(w in msg for w in ["example", "sample", "show me", "what does", "how does"]):
+        return "wants_example"
+    if any(w in msg for w in ["yes", "okay", "sounds good", "that's right", "correct", "perfect"]):
+        return "confirmation"
+    if any(w in msg for w in ["no", "not right", "different", "change", "wrong"]):
+        return "correction"
+    
+    # Language preferences
+    if any(w in msg for w in ["english", "hindi", "spanish", "language"]):
         return "language_selection"
-    if current_state == "need_name" and len(msg.split()) <= 3:
-        return "template_name"
-    if any(w in msg for w in ["message", "text", "content", "body", "say"]):
-        return "content_request"
-    if any(w in msg for w in ["done", "finish", "finalize", "complete", "ready", "yes"]):
-        return "finalize_request"
-    if any(w in msg for w in ["joke", "story", "weather", "hello", "hi", "hey"]):
-        return "chitchat"
-    return "unclear"
+    
+    # Content creation
+    if any(w in msg for w in ["write", "create", "make", "message", "text", "content"]):
+        return "content_creation"
+    
+    # Completion signals
+    if any(w in msg for w in ["done", "finish", "complete", "ready", "finalize", "looks good"]):
+        return "completion"
+    
+    # Greeting/chitchat
+    if any(w in msg for w in ["hello", "hi", "hey", "good morning", "good afternoon"]):
+        return "greeting"
+    
+    return "general_inquiry"
 
 def _determine_conversation_state(draft: Dict[str, Any], memory: Dict[str, Any]) -> str:
     has_category = bool(draft.get("category") or memory.get("category"))
@@ -303,6 +372,14 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
         else:
             c.pop("language", None)
 
+    # Normalize category to uppercase
+    if "category" in c and isinstance(c["category"], str) and c["category"].strip():
+        cat = c["category"].strip().upper()
+        if cat in ("MARKETING", "UTILITY", "AUTHENTICATION"):
+            c["category"] = cat
+        else:
+            c.pop("category", None)
+
     # drop blank strings
     for k in ("name","language","category"):
         if k in c and isinstance(c[k], str) and not c[k].strip():
@@ -332,7 +409,7 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
                     fmt = "TEXT"
                 if fmt == "TEXT" and txt:
                     clean.append({"type": "HEADER", "format": "TEXT", "text": txt})
-                elif fmt in {"IMAGE","VIDEO","DOCUMENT","LOCATION"}:
+                elif fmt in {"IMAGE","VIDEO","DOCUMENT"}:
                     item = {"type": "HEADER", "format": fmt}
                     if "example" in comp:
                         item["example"] = comp["example"]
@@ -347,23 +424,51 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
                     # Standard format: BUTTONS component with buttons array
                     b2 = []
                     for b in btns:
-                        if not isinstance(b, dict) or "type" not in b or "text" not in b:
+                        if not isinstance(b, dict):
                             continue
-                        bt = b["type"]
-                        if bt == "URL" and not b.get("url"):
+                        
+                        # Handle different text field variations from LLM
+                        btn_text = b.get("text") or b.get("label") or b.get("title")
+                        btn_type = b.get("type", "QUICK_REPLY")
+                        
+                        if not btn_text:
                             continue
-                        if bt == "PHONE_NUMBER" and not b.get("phone_number"):
-                            continue
-                        b2.append(b)
+                            
+                        # Normalize button structure
+                        btn = {"type": btn_type, "text": btn_text}
+                        
+                        # Preserve payload for quick replies
+                        payload = b.get("payload")
+                        if payload:
+                            btn["payload"] = payload
+                        
+                        # Add required fields for specific button types
+                        if btn_type == "URL":
+                            url = b.get("url")
+                            if not url:
+                                continue
+                            btn["url"] = url
+                        elif btn_type == "PHONE_NUMBER":
+                            phone = b.get("phone_number")
+                            if not phone:
+                                continue
+                            btn["phone_number"] = phone
+                            
+                        b2.append(btn)
                     if b2:
-                        clean.append({"type":"BUTTONS","buttons":b2})
-                elif comp.get("text"):
-                    # Malformed format: Individual BUTTONS component with text
+                        clean.append({"type":"BUTTONS","buttons": b2})
+                elif comp.get("text") or comp.get("label") or comp.get("title"):
+                    # Malformed format: Individual BUTTONS component with text/label/title
                     # Collect these to convert to proper format
-                    btn_text = comp.get("text").strip()
-                    btn_type = comp.get("button_type", "QUICK_REPLY")
+                    btn_text = (comp.get("text") or comp.get("label") or comp.get("title") or "").strip()
+                    btn_type = comp.get("button_type") or "QUICK_REPLY"
                     if btn_text:
-                        collected_buttons.append({"type": btn_type, "text": btn_text})
+                        btn = {"type": btn_type, "text": btn_text}
+                        # Preserve payload for collected buttons too
+                        payload = comp.get("payload")
+                        if payload:
+                            btn["payload"] = payload
+                        collected_buttons.append(btn)
         
         # Convert collected individual buttons to proper BUTTONS component
         if collected_buttons:
@@ -375,6 +480,46 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
             c.pop("components", None)
     elif "components" in c:
         c.pop("components", None)
+    
+    # Convert flat fields to proper component structures
+    # This handles cases where LLM outputs {BODY: "text"} or {body: "text"} instead of {components: [{type: "BODY", text: "text"}]}
+    components = c.get("components", [])
+    
+    # Handle flat BODY field (try both cases)
+    body_value = c.get("BODY") or c.get("body")
+    if body_value and isinstance(body_value, str) and body_value.strip():
+        body_text = body_value.strip()
+        # Check if BODY component already exists
+        has_body = any(comp.get("type") == "BODY" for comp in components if isinstance(comp, dict))
+        if not has_body:
+            components.insert(0, {"type": "BODY", "text": body_text})
+        c.pop("BODY", None)  # Remove flat fields
+        c.pop("body", None)
+    
+    # Handle flat HEADER field (try both cases) 
+    header_value = c.get("HEADER") or c.get("header")
+    if header_value and isinstance(header_value, str) and header_value.strip():
+        header_text = header_value.strip()
+        has_header = any(comp.get("type") == "HEADER" for comp in components if isinstance(comp, dict))
+        if not has_header:
+            components.append({"type": "HEADER", "format": "TEXT", "text": header_text})
+        c.pop("HEADER", None)
+        c.pop("header", None)
+    
+    # Handle flat FOOTER field (try both cases)
+    footer_value = c.get("FOOTER") or c.get("footer")
+    if footer_value and isinstance(footer_value, str) and footer_value.strip():
+        footer_text = footer_value.strip()
+        has_footer = any(comp.get("type") == "FOOTER" for comp in components if isinstance(comp, dict))
+        if not has_footer:
+            components.append({"type": "FOOTER", "text": footer_text})
+        c.pop("FOOTER", None)
+        c.pop("footer", None)
+    
+    # Update components if we added any
+    if components:
+        c["components"] = components
+    
     return c
 
 def _has_component(p: Dict[str, Any], kind: str) -> bool:
@@ -394,12 +539,17 @@ def _compute_missing(p: Dict[str, Any], memory: Dict[str, Any]) -> List[str]:
         for c in comps
     )
     if not has_body: miss.append("body")
-    if memory.get("wants_header") and not _has_component(p, "HEADER"):
-        miss.append("header")
-    if memory.get("wants_footer") and not _has_component(p, "FOOTER"):
-        miss.append("footer")
-    if memory.get("wants_buttons") and not _has_component(p, "BUTTONS"):
-        miss.append("buttons")
+    
+    # Extras only when allowed AND not skipped
+    cat = (p.get("category") or memory.get("category") or "").upper()
+    skip_extras = (memory.get("extras_choice") == "skip")
+    if cat != "AUTHENTICATION" and not skip_extras:
+        if memory.get("wants_header") and not _has_component(p, "HEADER"):
+            miss.append("header")
+        if memory.get("wants_footer") and not _has_component(p, "FOOTER"):
+            miss.append("footer")
+        if memory.get("wants_buttons") and not _has_component(p, "BUTTONS"):
+            miss.append("buttons")
     return miss
 
 def _minimal_scaffold(mem: Dict[str, Any]) -> Dict[str, Any]:
@@ -475,7 +625,42 @@ def _auto_apply_extras_on_yes(user_text: str, candidate: Dict[str, Any], memory:
         cand["components"] = comps
     return cand
 
-def _targeted_missing_reply(missing: List[str]) -> str:
+def _strip_non_schema_button_fields(candidate: Dict[str, Any]) -> None:
+    """Strip non-schema fields from buttons before validation (e.g., payload)"""
+    allowed = {
+        "QUICK_REPLY": {"type", "text"},
+        "URL": {"type", "text", "url"},
+        "PHONE_NUMBER": {"type", "text", "phone_number"},
+    }
+    for comp in (candidate.get("components") or []):
+        if (comp.get("type") or "").upper() == "BUTTONS" and isinstance(comp.get("buttons"), list):
+            for b in comp["buttons"]:
+                t = (b.get("type") or "QUICK_REPLY").upper()
+                for k in list(b.keys()):
+                    if k not in allowed.get(t, set()):
+                        b.pop(k, None)
+
+def _strip_component_extras(candidate: Dict[str, Any]) -> None:
+    """Strip non-schema fields from components before validation"""
+    allowed = {
+        "BODY": {"type", "text", "example"},      # Keep example for BODY if schema allows
+        "HEADER": {"type", "format", "text", "example"},  # Keep example for HEADER if schema allows
+        "FOOTER": {"type", "text"},
+        "BUTTONS": {"type", "buttons"},
+    }
+    for comp in (candidate.get("components") or []):
+        t = (comp.get("type") or "").upper()
+        keep = allowed.get(t)
+        if keep:
+            for k in list(comp.keys()):
+                if k not in keep:
+                    comp.pop(k, None)
+
+def _targeted_missing_reply(missing: List[str], memory: Dict[str, Any] = None) -> str:
+    # Handle AUTH constraint for buttons
+    if "buttons" in missing and memory and (memory.get("category") or "").upper() == "AUTHENTICATION":
+        return "Buttons aren't allowed for authentication templates; I'll proceed without them. Want a short TEXT header?"
+    
     # Pick the highest-priority missing slot and ask a focused question
     if "language" in missing:
         return "Great so far. Which language code should I use (e.g., en_US, hi_IN)?"
@@ -495,297 +680,11 @@ def _targeted_missing_reply(missing: List[str]) -> str:
 
 # ---------- Endpoints ----------
 
-@app.get("/health")
-async def health():
-    cfg = get_config()
-    return {"status": "ok", "model": cfg.get("model"), "db": "ok"}
 
-@app.post("/config/reload")
-async def config_reload():
-    """Reload configuration from disk"""
-    cfg = reload_config()
-    return {"ok": True, "model": cfg.get("model")}
 
-# ---------- User Management Endpoints ----------
 
-@app.post("/users", response_model=UserResponse)
-async def create_user(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
-    """
-    Create a new user with user_id and password.
-    In production, password should be hashed.
-    """
-    from sqlalchemy import select
-    
-    # Check if user already exists
-    result = await db.execute(select(User).where(User.user_id == user_data.user_id))
-    existing_user = result.scalar_one_or_none()
-    
-    if existing_user:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=400, detail="User already exists")
-    
-    # Create new user (in production, hash the password)
-    new_user = User(
-        user_id=user_data.user_id,
-        password=user_data.password  # TODO: Hash password in production
-    )
-    
-    db.add(new_user)
-    await db.commit()
-    await db.refresh(new_user)
-    
-    return UserResponse(
-        user_id=new_user.user_id,
-        created_at=new_user.created_at.isoformat(),
-        updated_at=new_user.updated_at.isoformat()
-    )
 
-@app.post("/users/login")
-async def login_user(login_data: UserLogin, db: AsyncSession = Depends(get_db)):
-    """
-    Authenticate user with user_id and password.
-    Returns user info if credentials are valid.
-    """
-    from sqlalchemy import select
-    from fastapi import HTTPException
-    
-    # Find user
-    result = await db.execute(select(User).where(User.user_id == login_data.user_id))
-    user = result.scalar_one_or_none()
-    
-    if not user or user.password != login_data.password:  # TODO: Use proper password hashing
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    return {
-        "user_id": user.user_id,
-        "message": "Login successful",
-        "created_at": user.created_at.isoformat(),
-        "updated_at": user.updated_at.isoformat()
-    }
-
-@app.get("/users/{user_id}/sessions", response_model=UserSessionsResponse)
-async def get_user_sessions(user_id: str, db: AsyncSession = Depends(get_db)):
-    """
-    Get all sessions created by a specific user, ordered by update time (newest first).
-    """
-    from sqlalchemy import select, func, desc
-    from fastapi import HTTPException
-    
-    # Verify user exists
-    user_result = await db.execute(select(User).where(User.user_id == user_id))
-    user = user_result.scalar_one_or_none()
-    
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # Get all user sessions with session details
-    query = select(
-        UserSession.session_id,
-        UserSession.session_name,
-        UserSession.created_at,
-        UserSession.updated_at,
-        DBSession.data,
-        DBSession.updated_at.label('session_last_activity')
-    ).select_from(
-        UserSession.__table__.join(DBSession, UserSession.session_id == DBSession.id)
-    ).where(
-        UserSession.user_id == user_id
-    ).order_by(desc(UserSession.updated_at))
-    
-    result = await db.execute(query)
-    sessions_data = result.fetchall()
-    
-    sessions = []
-    for session_data in sessions_data:
-        # Count messages in session
-        messages = session_data.data.get("messages", []) if session_data.data else []
-        message_count = len(messages)
-        
-        sessions.append(UserSessionInfo(
-            session_id=session_data.session_id,
-            session_name=session_data.session_name,
-            created_at=session_data.created_at.isoformat(),
-            updated_at=session_data.updated_at.isoformat(),
-            message_count=message_count,
-            last_activity=session_data.session_last_activity.isoformat() if session_data.session_last_activity else session_data.updated_at.isoformat()
-        ))
-    
-    return UserSessionsResponse(
-        user_id=user_id,
-        sessions=sessions,
-        total_sessions=len(sessions)
-    )
-
-@app.put("/users/{user_id}/sessions/{session_id}/name")
-async def update_session_name(user_id: str, session_id: str, session_name: str, db: AsyncSession = Depends(get_db)):
-    """
-    Update the name/title of a user session for display purposes.
-    """
-    from sqlalchemy import select, update
-    from fastapi import HTTPException
-    
-    # Find the user session
-    result = await db.execute(
-        select(UserSession).where(
-            UserSession.user_id == user_id,
-            UserSession.session_id == session_id
-        )
-    )
-    user_session = result.scalar_one_or_none()
-    
-    if not user_session:
-        raise HTTPException(status_code=404, detail="Session not found for this user")
-    
-    # Update session name
-    await db.execute(
-        update(UserSession)
-        .where(UserSession.user_id == user_id, UserSession.session_id == session_id)
-        .values(session_name=session_name)
-    )
-    await db.commit()
-    
-    return {"message": "Session name updated successfully", "session_name": session_name}
-
-@app.get("/session/new")
-async def new_session_get(user_id: str = None, db: AsyncSession = Depends(get_db)):
-    """
-    Create a new session (GET method for backward compatibility).
-    If user_id is provided, the session will be linked to that user.
-    """
-    s = await get_or_create_session(db, None)
-    
-    # If user_id is provided, create user session association
-    if user_id:
-        from sqlalchemy import select
-        
-        # Verify user exists
-        user_result = await db.execute(select(User).where(User.user_id == user_id))
-        user = user_result.scalar_one_or_none()
-        
-        if user:
-            # Create user session association using upsert
-            await _upsert_user_session(db, user_id, s.id, None)
-    
-    await db.commit()
-    return {"session_id": s.id}
-
-@app.post("/session/new", response_model=SessionCreateResponse)
-async def new_session_post(session_data: SessionCreate, db: AsyncSession = Depends(get_db)):
-    """
-    Create a new session with optional name and user association.
-    Allows users to provide a meaningful name like 'Diwali Template Creation'.
-    """
-    s = await get_or_create_session(db, None)
-    
-    session_name = session_data.session_name
-    user_id = session_data.user_id
-    
-    # If user_id is provided, create user session association
-    if user_id:
-        from sqlalchemy import select
-        
-        # Verify user exists
-        user_result = await db.execute(select(User).where(User.user_id == user_id))
-        user = user_result.scalar_one_or_none()
-        
-        if user:
-            # Create user session association with the provided name using upsert
-            await _upsert_user_session(db, user_id, s.id, session_name)
-    
-    await db.commit()
-    return SessionCreateResponse(
-        session_id=s.id,
-        session_name=session_name,
-        user_id=user_id
-    )
-
-@app.get("/session/{session_id}", response_model=SessionData)
-async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
-    """
-    Retrieve session data including chat history for UI integration.
-    Returns messages in chronological order for chat UI display.
-    """
-    s = await get_or_create_session(db, session_id)
-    
-    # Get current draft
-    current_draft = {}
-    if s.active_draft_id:
-        draft = await db.get(Draft, s.active_draft_id)
-        if draft:
-            current_draft = draft.draft or {}
-    
-    # Extract messages
-    messages_data = (s.data or {}).get("messages", [])
-    messages = [ChatMessage(role=msg["role"], content=msg["content"]) for msg in messages_data]
-    
-    return SessionData(
-        session_id=s.id,
-        messages=messages,
-        draft=current_draft,
-        memory=s.memory or {},
-        last_action=s.last_action,
-        updated_at=s.updated_at.isoformat() if s.updated_at else ""
-    )
-
-@app.get("/session/{session_id}/debug", response_model=SessionDebugData)
-async def get_session_debug(session_id: str, db: AsyncSession = Depends(get_db)):
-    """
-    Debug endpoint: Get complete session data including LLM request/response logs.
-    Provides detailed information for troubleshooting and development.
-    """
-    from sqlalchemy import text
-    
-    s = await get_or_create_session(db, session_id)
-    
-    # Get current draft
-    current_draft = {}
-    if s.active_draft_id:
-        draft = await db.get(Draft, s.active_draft_id)
-        if draft:
-            current_draft = draft.draft or {}
-    
-    # Extract messages
-    messages_data = (s.data or {}).get("messages", [])
-    messages = [ChatMessage(role=msg["role"], content=msg["content"]) for msg in messages_data]
-    
-    # Get LLM logs for this session
-    result = await db.execute(text("""
-        SELECT direction, payload, model, latency_ms, ts
-        FROM llm_logs 
-        WHERE session_id = :session_id 
-        ORDER BY ts ASC
-    """), {"session_id": session_id})
-    
-    llm_logs = []
-    for log in result.fetchall():
-        llm_logs.append(LLMLogEntry(
-            timestamp=log[4].isoformat() if log[4] else "",
-            direction=log[0],
-            payload=log[1] or {},
-            model=log[2],
-            latency_ms=log[3]
-        ))
-    
-    # Session info for debugging
-    session_info = {
-        "id": s.id,
-        "active_draft_id": s.active_draft_id,
-        "last_question_hash": s.last_question_hash,
-        "created_at": s.updated_at.isoformat() if s.updated_at else "",
-        "total_messages": len(messages),
-        "total_llm_calls": len(llm_logs)
-    }
-    
-    return SessionDebugData(
-        session_id=s.id,
-        session_info=session_info,
-        messages=messages,
-        current_draft=current_draft,
-        memory=s.memory or {},
-        llm_logs=llm_logs,
-        last_action=s.last_action,
-        updated_at=s.updated_at.isoformat() if s.updated_at else ""
-    )
+# ---------- Endpoints ----------
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
@@ -811,7 +710,8 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
     msgs: List[Dict[str, str]] = (s.data or {}).get("messages", [])
 
     # 2) Build LLM inputs + call
-    system = build_system_prompt(cfg)
+    # Use friendly system prompt for better user experience
+    system = build_friendly_system_prompt(cfg)
     context = build_context_block(draft, memory, cfg, msgs)
     safe_message = _sanitize_user_input(inp.message)
 
@@ -829,35 +729,53 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
     user_intent = _classify_user_intent(safe_message, current_state)
     memory["_system_state"] = current_state
     memory["_user_intent"] = user_intent
+    
+    # Track journey stage for friendly prompts
+    journey_stage = _get_journey_stage_from_memory(memory)
+    memory["_journey_stage"] = journey_stage
+    
+    # Check for explicit content provision
+    explicit_content = _extract_explicit_content(safe_message)
+    if explicit_content:
+        memory["user_provided_content"] = explicit_content
+        memory["content_extraction_hint"] = f"User provided: {explicit_content[:50]}..."
+    
     s.memory = memory
 
     # Auto-name session if this is the first message and user_id is provided
     if inp.user_id and len(msgs) == 0:
-        # This is the first message - auto-generate a name
-        category = memory.get("category") or draft.get("category")
-        await _auto_name_session_if_needed(db, inp.user_id, s.id, safe_message, category)
+        from sqlalchemy import select
+        user = (await db.execute(select(User).where(User.user_id == inp.user_id))).scalar_one_or_none()
+        if user:
+            # Ensure the association exists, then auto-name
+            await upsert_user_session(db, inp.user_id, s.id, None)
+            category = memory.get("category") or draft.get("category")
+            await _auto_name_session_if_needed(db, inp.user_id, s.id, safe_message, category)
 
     llm = LlmClient(model=cfg.get("model", "gpt-4o-mini"),
                     temperature=float(cfg.get("temperature", 0.2)))
+
+    # Log request before calling LLM for better failure trails
+    # Use scrubbed data for logging only (preserve sensitive data for LLM processing)
+    log_user = scrub_sensitive_data(safe_message)
+    request_payload = {"system": system, "context": context, "history": msgs,
+                      "user": log_user, "state": current_state, "intent": user_intent}
+    await log_llm(db, s.id, "request", _redact_secrets(request_payload), cfg.get("model"), None)
 
     try:
         out = llm.respond(system, context, msgs, safe_message)
         out = _validate_llm_response(out)
     except Exception as e:
-        await log_llm(db, s.id, "error",
-                      {"error": str(e), "user_input": safe_message},
-                      cfg.get("model"), None)
+        error_payload = {"error": str(e), "user_input": scrub_sensitive_data(safe_message)}
+        await log_llm(db, s.id, "error", _redact_secrets(error_payload), cfg.get("model"), None)
         fallback = _fallback_reply_for_state(current_state)
+        await db.commit()  # ensure any earlier inserts/updates (e.g., user_session) persist
         return ChatResponse(session_id=s.id, reply=fallback,
                             draft=draft, missing=_compute_missing(draft, memory),
                             final_creation_payload=None)
 
-    # logs
-    await log_llm(db, s.id, "request",
-                  {"system": system, "context": context, "history": msgs,
-                   "user": safe_message, "state": current_state, "intent": user_intent},
-                  cfg.get("model"), None)
-    await log_llm(db, s.id, "response", out, cfg.get("model"), out.get("_latency_ms"))
+    # Log response
+    await log_llm(db, s.id, "response", _redact_secrets(out), cfg.get("model"), out.get("_latency_ms"))
 
     # 3) Extract outputs
     action = str(out.get("agent_action") or "ASK").upper()
@@ -869,6 +787,9 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         s.memory = memory
     if _user_declined_extras(safe_message):
         memory = merge_deep(memory, {"extras_choice": "skip"})
+        # Clear any pending extras to avoid repeated prompts
+        for k in ("wants_header", "wants_footer", "wants_buttons"):
+            memory.pop(k, None)
         s.memory = memory
 
     # local history helper
@@ -885,8 +806,10 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
     # Helper to persist a turn
     async def _persist_turn_and_return(reply_text: str, new_draft: Dict[str, Any], missing_list: List[str]):
         s.last_action = action
+        # Track question hash to break repeats
+        s.last_question_hash = _qhash(reply_text) if reply_text.endswith("?") else None
         s.data = {**(s.data or {}), "messages": _append_history(inp.message, reply_text)}
-        await _update_user_session_if_needed(db, inp.user_id, s.id)
+        await touch_user_session(db, inp.user_id, s.id)
         await upsert_session(db, s); await db.commit()
         return ChatResponse(session_id=s.id, reply=reply_text, draft=new_draft,
                             missing=missing_list, final_creation_payload=None)
@@ -905,12 +828,55 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
 
         d.draft = merged
 
-        # Trust LLM's missing, supplement only if obviously incomplete
-        llm_missing = out.get("missing") or []
+        # Trust LLM for guidance but correct it with actual state
+        llm_missing = (out.get("missing") or [])
         computed_missing = _compute_missing(merged, memory)
-        missing = list(dict.fromkeys(llm_missing + [m for m in computed_missing if m in ["category","language","name","body"]]))
 
-        final_reply = (reply or _targeted_missing_reply(missing)).strip()
+        # Remove extras that we already applied/present now
+        extras_present = {
+            "header": _has_component(merged, "HEADER"),
+            "buttons": _has_component(merged, "BUTTONS"),
+            "footer": _has_component(merged, "FOOTER"),
+        }
+        llm_missing = [
+            m for m in llm_missing
+            if m not in ("header", "buttons", "footer") or not extras_present.get(m, False)
+        ]
+
+        # Keep only the core fields from server if LLM forgot them
+        core = [m for m in computed_missing if m in ["category", "language", "name", "body"]]
+        missing = list(dict.fromkeys(llm_missing + core))
+
+        # Mark success in memory after applying extras
+        if any(extras_present.values()):
+            memory = merge_deep(memory, {"extras_choice": "accepted"})
+            s.memory = memory
+
+        final_reply = (reply or _targeted_missing_reply(missing, memory)).strip()
+
+        # Add encouragement and examples from friendly_prompts when appropriate
+        if len(msgs) > 0 and any(extras_present.values()):
+            import random
+            encouragement = random.choice(get_encouragement_messages())
+            final_reply = f"{encouragement} {final_reply}"
+        
+        # Provide helpful examples if user seems stuck
+        if "example" in safe_message.lower() or "sample" in safe_message.lower():
+            category = merged.get("category") or memory.get("category")
+            if category:
+                examples = get_helpful_examples()
+                category_examples = examples.get(f"{category.lower()}_examples", [])
+                if category_examples:
+                    example = random.choice(category_examples)
+                    final_reply += f"\n\nHere's an example: {example}"
+
+        if _has_component(merged, "BUTTONS") and "button" in (final_reply.lower()):
+            # Replace the stale question with a confirmation
+            final_reply = "Added two quick replies (View offers / Order now). Anything else to add?"
+        if extras_present["header"] and "header" in final_reply.lower():
+            final_reply = "Added a short TEXT header. Anything else to add?"
+        if extras_present["footer"] and "footer" in final_reply.lower():
+            final_reply = "Added a short footer. Anything else to add?"
         return await _persist_turn_and_return(final_reply, merged, missing)
 
     # 7) FINAL → sanitize -> validate -> persist (also enforce requested extras)
@@ -922,58 +888,65 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         def _has_component_kind(p: Dict[str, Any], kind: str) -> bool:
             return any(isinstance(c, dict) and (c.get("type") or "").upper() == kind for c in (p.get("components") or []))
 
-        # enforce requested extras before validate
+        # enforce requested extras before validate (only for non-AUTH categories)
         missing_extras = []
-        if memory.get("wants_header") and not _has_component_kind(candidate, "HEADER"):
-            missing_extras.append("header")
-        if memory.get("wants_footer") and not _has_component_kind(candidate, "FOOTER"):
-            missing_extras.append("footer")
-        if memory.get("wants_buttons") and not _has_component_kind(candidate, "BUTTONS"):
-            missing_extras.append("buttons")
+        cat = (candidate.get("category") or memory.get("category") or "").upper()
+        if cat != "AUTHENTICATION":
+            if memory.get("wants_header") and not _has_component_kind(candidate, "HEADER"):
+                missing_extras.append("header")
+            if memory.get("wants_footer") and not _has_component_kind(candidate, "FOOTER"):
+                missing_extras.append("footer")
+            if memory.get("wants_buttons") and not _has_component_kind(candidate, "BUTTONS"):
+                missing_extras.append("buttons")
 
         if missing_extras:
             d.draft = merge_deep(draft, candidate)
             s.last_action = "ASK"
-            ask = _targeted_missing_reply(missing_extras)
+            ask = _targeted_missing_reply(missing_extras, memory)
             s.data = {**(s.data or {}), "messages": _append_history(inp.message, ask)}
-            await _update_user_session_if_needed(db, inp.user_id, s.id)
+            await touch_user_session(db, inp.user_id, s.id)
             await upsert_session(db, s); await db.commit()
             return ChatResponse(session_id=s.id, reply=ask, draft=d.draft,
                                 missing=_compute_missing(d.draft, memory),
                                 final_creation_payload=None)
 
         schema = cfg.get("creation_payload_schema", {}) or {}
-        issues = validate_schema(candidate, schema)
-        issues += lint_rules(candidate, cfg.get("lint_rules", {}) or {})
+        # Validate a deep copy to preserve rich draft data (e.g., button payloads)
+        import copy
+        candidate_for_validation = copy.deepcopy(candidate)
+        _strip_component_extras(candidate_for_validation)
+        _strip_non_schema_button_fields(candidate_for_validation)
+        issues = validate_schema(candidate_for_validation, schema)
+        issues += lint_rules(candidate_for_validation, cfg.get("lint_rules", {}) or {})
 
         if issues:
-            d.draft = merge_deep(draft, candidate)
+            d.draft = merge_deep(draft, candidate)  # keep rich draft
             s.last_action = "ASK"
             final_reply = (reply + ("\n\nPlease fix: " + "; ".join(issues) if issues else "")).strip()
             s.data = {**(s.data or {}), "messages": _append_history(inp.message, final_reply)}
-            await _update_user_session_if_needed(db, inp.user_id, s.id)
+            await touch_user_session(db, inp.user_id, s.id)
             await upsert_session(db, s); await db.commit()
             return ChatResponse(session_id=s.id, reply=final_reply, draft=d.draft,
                                 missing=_compute_missing(d.draft, memory) + ["fix_validation_issues"],
                                 final_creation_payload=None)
 
         # Valid → finalize
-        d.finalized_payload = candidate
+        d.finalized_payload = candidate_for_validation  # schema-pure for WhatsApp API
         d.status = "FINAL"
-        d.draft = candidate
+        d.draft = candidate  # keep rich draft for UI
         s.last_action = "FINAL"
         s.data = {**(s.data or {}), "messages": _append_history(inp.message, reply or "Finalized.")}
-        await _update_user_session_if_needed(db, inp.user_id, s.id)
+        await touch_user_session(db, inp.user_id, s.id)
         await upsert_session(db, s); await db.commit()
         return ChatResponse(session_id=s.id, reply=reply or "Finalized.", draft=d.draft,
-                            missing=None, final_creation_payload=candidate)
+                            missing=None, final_creation_payload=candidate_for_validation)
 
     # 8) Fallback (treat as ASK)
     final_draft = candidate or draft
     d.draft = final_draft
     s.last_action = "ASK"
     missing = _compute_missing(final_draft, memory)
-    final_reply = (reply or _targeted_missing_reply(missing)).strip()
+    final_reply = (reply or _targeted_missing_reply(missing, memory)).strip()
 
     # anti-loop: if same question and user affirmed, proactively fill one slot
     if final_reply.endswith("?"):
@@ -990,43 +963,173 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
             d.draft = base
             final_draft = base
             missing = _compute_missing(final_draft, memory)
-            final_reply = _targeted_missing_reply(missing)
+            final_reply = _targeted_missing_reply(missing, memory)
         s.last_question_hash = qh
     else:
         s.last_question_hash = None
 
     s.data = {**(s.data or {}), "messages": _append_history(inp.message, final_reply)}
-    await _update_user_session_if_needed(db, inp.user_id, s.id)
+    await touch_user_session(db, inp.user_id, s.id)
     await upsert_session(db, s); await db.commit()
     return ChatResponse(session_id=s.id, reply=final_reply, draft=final_draft,
                         missing=missing, final_creation_payload=None)
 
-async def _upsert_user_session(db: AsyncSession, user_id: str, session_id: str, session_name: str = None):
-    """Create or update a user session association"""
-    from sqlalchemy import select, update, func
+@app.get("/welcome")
+async def get_welcome_message():
+    """
+    Get a friendly welcome message for new users starting their template creation journey.
+    Perfect for showing in the UI before the first chat interaction.
+    """
+    from .friendly_prompts import get_journey_welcome_message, get_helpful_examples
     
-    # Check if user session association already exists
-    result = await db.execute(
-        select(UserSession).where(
-            UserSession.user_id == user_id,
-            UserSession.session_id == session_id
-        )
-    )
-    existing = result.scalar_one_or_none()
+    # Get examples from friendly prompts
+    examples_data = get_helpful_examples()
     
-    if existing:
-        # Update existing if session_name is provided
-        if session_name is not None:
-            await db.execute(
-                update(UserSession)
-                .where(UserSession.user_id == user_id, UserSession.session_id == session_id)
-                .values(session_name=session_name, updated_at=func.now())
-            )
+    return {
+        "message": get_journey_welcome_message(),
+        "journey_stage": "welcome",
+        "next_steps": [
+            "Tell me what kind of message you want to send",
+            "Describe your business or use case", 
+            "Let me know your goal in simple words"
+        ],
+        "examples": [
+            "I want to send discount offers to my customers",
+            "I need to confirm orders for my restaurant",
+            "I want to send appointment reminders", 
+            "I'd like to welcome new customers"
+        ],
+        "sample_templates": {
+            "marketing": examples_data.get("marketing_examples", [])[:2],
+            "utility": examples_data.get("utility_examples", [])[:2],
+            "authentication": examples_data.get("authentication_examples", [])[:1]
+        }
+    }
+
+# ---------- Helper Functions ----------
+
+def _get_business_examples_for_category(category: str) -> list:
+    """Get relatable business examples for different template categories."""
+    examples = {
+        "MARKETING": [
+            "🛍️ Clothing store sending discount offers",
+            "🍕 Restaurant promoting new menu items", 
+            "💄 Beauty salon announcing special packages",
+            "📱 Electronics store with sale notifications"
+        ],
+        "UTILITY": [
+            "📦 E-commerce order confirmations",
+            "🏥 Medical appointment reminders",
+            "🚗 Service center status updates", 
+            "💳 Payment confirmation messages"
+        ],
+        "AUTHENTICATION": [
+            "🔐 Login verification codes",
+            "📱 Account security confirmations",
+            "🛡️ Two-factor authentication codes"
+        ]
+    }
+    return examples.get(category, [])
+
+def _generate_beginner_friendly_name(user_input: str, business_type: str = "", category: str = "") -> str:
+    """Generate template names that make sense to beginners."""
+    user_lower = user_input.lower()
+    
+    # Extract key concepts
+    if "discount" in user_lower or "offer" in user_lower or "sale" in user_lower:
+        base = "discount_offer"
+    elif "welcome" in user_lower or "greeting" in user_lower:
+        base = "welcome_message"
+    elif "appointment" in user_lower or "reminder" in user_lower:
+        base = "appointment_reminder"
+    elif "order" in user_lower or "confirmation" in user_lower:
+        base = "order_confirmation"
+    elif "birthday" in user_lower or "special day" in user_lower:
+        base = "birthday_wishes"
+    elif "new product" in user_lower or "launch" in user_lower:
+        base = "new_product_launch"
     else:
-        # Create new
-        user_session = UserSession(
-            user_id=user_id,
-            session_id=session_id,
-            session_name=session_name
-        )
-        db.add(user_session)
+        # Fallback based on category
+        if category == "MARKETING":
+            base = "promotional_message"
+        elif category == "UTILITY":
+            base = "notification_message"
+        elif category == "AUTHENTICATION":
+            base = "verification_code"
+        else:
+            base = "business_message"
+    
+    # Add business context if available
+    if business_type:
+        business_slug = _slug(business_type)
+        base = f"{business_slug}_{base}"
+    
+    return base
+
+def _provide_content_suggestions(category: str, business_type: str = "", user_goal: str = "") -> list:
+    """Provide content suggestions based on user's business and goals."""
+    suggestions = []
+    
+    if category == "MARKETING":
+        suggestions = [
+            "Hi {{1}}! 🎉 Special offer just for you - 20% off everything! Use code SAVE20. Shop now!",
+            "Hello {{1}}! New arrivals are here! Be the first to see our latest {{2}} collection. Visit us today!",
+            "Hey {{1}}! Flash sale alert! Get {{2}} at amazing prices. Limited time only! 🔥"
+        ]
+    elif category == "UTILITY":
+        suggestions = [
+            "Hi {{1}}! Your order #{{2}} has been confirmed. Expected delivery: {{3}}. Track anytime!",
+            "Hello {{1}}! Appointment reminder for {{2}} at {{3}}. Looking forward to seeing you!",
+            "Hi {{1}}! Your {{2}} has been updated. New status: {{3}}. Thanks for choosing us!"
+        ]
+    elif category == "AUTHENTICATION":
+        suggestions = [
+            "Your verification code is {{1}}. Enter this code to complete login. Expires in {{2}} minutes.",
+            "Security code: {{1}}. Use this to verify your account. Never share this code. Valid for {{2}} minutes."
+        ]
+    
+    return suggestions
+
+def _get_journey_stage_from_memory(memory: dict) -> str:
+    """Determine what stage of the journey the user is in."""
+    if not memory.get("category") and not memory.get("business_type"):
+        return "welcome"
+    elif memory.get("business_type") and not memory.get("category"):
+        return "choose_type"
+    elif memory.get("category") and not memory.get("proposed_content"):
+        return "create_content"
+    elif memory.get("proposed_content") and not memory.get("extras_offered"):
+        return "add_extras"
+    else:
+        return "review"
+
+def _extract_explicit_content(message: str) -> str:
+    """Extract explicit content when user provides it directly."""
+    msg = message.strip()
+    
+    # Common patterns users use to provide content
+    patterns = [
+        r"the message should say:?\s*(.+)",
+        r"the message is:?\s*(.+)", 
+        r"message content:?\s*(.+)",
+        r"the text should be:?\s*(.+)",
+        r"here'?s the message:?\s*(.+)",
+        r"use this message:?\s*(.+)",
+        r"send this:?\s*(.+)",
+        r"say:?\s*(.+)",
+    ]
+    
+    import re
+    for pattern in patterns:
+        match = re.search(pattern, msg, re.IGNORECASE | re.DOTALL)
+        if match:
+            content = match.group(1).strip()
+            # Remove quotes if present
+            if (content.startswith('"') and content.endswith('"')) or \
+               (content.startswith("'") and content.endswith("'")):
+                content = content[1:-1]
+            return content
+    
+    return ""
+
+

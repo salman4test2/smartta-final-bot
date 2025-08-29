@@ -687,15 +687,27 @@ curl -X PUT "http://localhost:8000/users/test_user/sessions/SESSION_ID/name?sess
 
 **Problem:** User requests buttons/header but system keeps asking the same confirmation question.
 
-**Solution:** This issue was resolved in the latest version. The backend now properly handles malformed button responses from the LLM and converts them to the correct format.
+**Solution:** ✅ **FULLY RESOLVED** in the latest version. The backend now:
+
+1. **Sanitizes LLM missing lists** after auto-applying extras
+2. **Records question hashes** on every turn to break loops  
+3. **Handles AUTH constraints** properly (no buttons for authentication templates)
+4. **Marks applied extras** in memory to prevent re-asking
 
 **Example Flow:**
 ```javascript
 // User: "add 2 buttons"
 // Bot: "Should I add two quick replies like 'View offers' and 'Order now'?"
 // User: "yes"
-// Bot: ✅ Template finalized with buttons (not stuck in loop)
+// Bot: ✅ "Added two quick replies (View offers / Order now). Anything else to add?"
+// OR: ✅ Template finalized with buttons (not stuck in loop)
 ```
+
+**Technical Fixes Applied:**
+- LLM missing list is corrected with actual template state
+- Button field variations (`text`, `label`, `title`) are normalized
+- Question hash tracking prevents repeated questions
+- AUTH templates properly reject button requests with explanation
 
 ### Button Format Issues
 
@@ -748,3 +760,114 @@ const response = await fetch('/session/new', {
   })
 });
 ```
+
+### Authentication Template Constraints
+
+**Important:** Authentication templates have specific constraints:
+
+- ❌ **No custom buttons allowed** (only OTP functionality)
+- ❌ **No custom media/headers** for security
+- ✅ **Only BODY with verification code variables**
+
+**Expected Behavior:**
+```javascript
+// User: "Create auth template with buttons"
+// Bot: "Buttons aren't allowed for authentication templates; I'll proceed without them. Want a short TEXT header?"
+```
+
+**Valid AUTH Template Structure:**
+```json
+{
+  "category": "AUTHENTICATION",
+  "name": "otp_verification", 
+  "language": "en_US",
+  "components": [
+    {
+      "type": "BODY",
+      "text": "{{1}} is your verification code. Do not share this code. It expires in {{2}} minutes."
+    }
+  ]
+}
+```
+
+---
+
+## 🔧 Recent Backend Improvements & Polish
+
+### Version 1.2 - Production Hardening (Latest)
+
+#### Critical Bug Fixes:
+- **Button Type Fallback**: Fixed critical bug where malformed BUTTONS components could incorrectly default to "BUTTONS" type instead of "QUICK_REPLY" when normalizing individual button components
+- **Import Optimization**: Removed redundant `import re` statement in `_generate_session_name_from_message` function
+- **Debug Endpoint**: Fixed mislabeled field in `/session/{id}/debug` endpoint - changed "created_at" to "updated_at" for accuracy
+
+#### Button Normalization Robustness:
+- Handles LLM variants: `text`, `label`, `title` are all normalized to `text`
+- Preserves button payloads during normalization for both standard and collected buttons
+- Malformed BUTTONS components are safely collected into proper format
+- All fallback button types default to "QUICK_REPLY" (never "BUTTONS")
+
+#### Loop Prevention & UX:
+- Post-sanitization of LLM missing list prevents stale prompts
+- Replaced stale header/footer/button questions with confirmation messages
+- Consolidated memory management for `extras_choice: accepted`
+- AUTH templates never block on missing extras during FINAL submission
+
+#### Verification:
+- All changes verified with direct API smoke tests
+- Button addition, AUTH flow, and malformed normalization tested
+- Loop prevention confirmed working
+- Session debug endpoint validated
+
+### Integration Notes:
+- Frontend should handle both `text` and `title` fields in button responses for maximum compatibility
+- Watch for confirmation messages vs. questions to provide appropriate UI feedback
+- DEBUG endpoint now correctly shows `updated_at` timestamp for sessions
+
+---
+
+### Version 1.3 - Final Edge Case Resolution
+
+#### Critical Loop Prevention Fix:
+- **Extras Decline Handling**: Fixed remaining edge case where "no buttons" would still trigger button prompts
+- **Wants Flag Clearing**: When user declines extras with phrases like "no buttons", "skip header", etc., the system now clears all `wants_*` flags to prevent repeated prompts
+- **Skip Honor in Missing Calculation**: `_compute_missing` now respects `extras_choice: "skip"` and won't mark declined extras as missing
+- **Complete De-staling**: Extended confirmation replacement to header and footer prompts (matching button behavior)
+
+#### Memory Management Polish:
+- **Consolidated Accepted State**: Streamlined `extras_choice: "accepted"` memory writes from three separate blocks to one efficient check
+- **Consistent Flag Management**: Ensures memory state accurately reflects user choices throughout the conversation
+
+#### Verification:
+- ✅ "no buttons" → immediately clears wants_buttons flag → no more button prompts
+- ✅ Skip extras properly honored in missing calculation
+- ✅ All extras (header, footer, buttons) get confirmation messages when auto-added
+- ✅ Memory state remains clean and consistent
+
+**Result**: Complete elimination of all known loop scenarios while maintaining robust template building flow.
+
+---
+
+### Version 1.4 - Final Polish & Production Readiness (Latest)
+
+#### Quality & Security Improvements:
+- **Affirmation Detection**: Fixed false positives with whole-word regex matching - "yesterday" no longer triggers as "yes"
+- **Language Normalization**: Enhanced to support space-separated codes ("en us" → "en_US")
+- **Auto-naming Robustness**: Category case normalization ensures consistent naming regardless of input case
+- **Button Field Management**: Two-phase approach - preserve payloads during draft phase, strip non-schema fields at FINAL validation
+- **Logging Security**: Added reminders for production logging hygiene and CORS lockdown
+
+#### Technical Enhancements:
+- **First-Message Auto-naming**: Fixed edge case where UserSession association didn't exist yet
+- **Request Logging Order**: Moved request logging before LLM call for better failure trail analysis
+- **Field Stripping**: Automatic removal of non-WhatsApp-API fields (like `payload`) before final validation
+- **Case-Insensitive Categories**: Auto-naming now works with any case variation of category names
+
+#### Verification Results:
+- ✅ "yesterday" → `False` (no longer false positive)
+- ✅ "en us" → `en_US` (space handling)
+- ✅ Category "marketing" → "Marketing Promo Promotion Template" (case normalization)
+- ✅ Payloads preserved in draft, stripped in FINAL (two-phase validation)
+- ✅ UserSession association created before auto-naming (first message fix)
+
+**Status**: Production-ready with comprehensive edge case handling, security considerations, and robust validation pipeline.

@@ -38,6 +38,9 @@ class SessionCreateResponse(BaseModel):
     session_name: Optional[str] = None
     user_id: Optional[str] = None
 
+class SessionRename(BaseModel):
+    session_name: str
+
 # Chat and session schemas
 class ChatInput(BaseModel):
     message: str
