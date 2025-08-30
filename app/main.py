@@ -433,6 +433,12 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
                         
                         if not btn_text:
                             continue
+                        
+                        # Normalize invalid button types to valid WhatsApp API types
+                        if btn_type.lower() in ("reply", "button"):
+                            btn_type = "QUICK_REPLY"
+                        elif btn_type.upper() not in ("QUICK_REPLY", "URL", "PHONE_NUMBER"):
+                            btn_type = "QUICK_REPLY"  # Default fallback
                             
                         # Normalize button structure
                         btn = {"type": btn_type, "text": btn_text}
@@ -519,6 +525,67 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
     # Update components if we added any
     if components:
         c["components"] = components
+    
+    # HANDLE ROOT-LEVEL BUTTONS: Convert to proper BUTTONS component or remove duplicates
+    if "buttons" in c and c["buttons"]:
+        components = c.get("components", [])
+        
+        # Check if we already have a BUTTONS component
+        has_button_component = any(
+            isinstance(comp, dict) and comp.get("type") == "BUTTONS"
+            for comp in components
+        )
+        
+        if has_button_component:
+            # Remove root-level buttons to prevent duplication
+            c.pop("buttons", None)
+        else:
+            # Convert root-level buttons to proper BUTTONS component
+            root_buttons = c.pop("buttons")
+            
+            # Normalize button structure for components
+            normalized_buttons = []
+            for btn in root_buttons:
+                if isinstance(btn, dict):
+                    # Handle different button formats from LLM
+                    if btn.get("type") == "reply" and btn.get("reply"):
+                        # Convert reply format to standard format
+                        reply = btn["reply"]
+                        normalized_btn = {
+                            "type": "QUICK_REPLY",
+                            "text": reply.get("title") or reply.get("text", "Button")
+                        }
+                        if reply.get("id"):
+                            normalized_btn["payload"] = reply["id"]
+                        normalized_buttons.append(normalized_btn)
+                    else:
+                        # Standard format or other types - try multiple text fields
+                        btn_text = (btn.get("text") or btn.get("title") or btn.get("label") or 
+                                   btn.get("value") or "Button")
+                        btn_type = btn.get("type", "QUICK_REPLY")
+                        
+                        # Normalize invalid button types to valid WhatsApp API types
+                        if btn_type.lower() in ("reply", "button"):
+                            btn_type = "QUICK_REPLY"
+                        elif btn_type.upper() not in ("QUICK_REPLY", "URL", "PHONE_NUMBER"):
+                            btn_type = "QUICK_REPLY"  # Default fallback
+                        
+                        normalized_btn = {"type": btn_type, "text": btn_text}
+                        
+                        # Preserve additional fields
+                        if btn.get("payload"):
+                            normalized_btn["payload"] = btn["payload"]
+                        if btn.get("url"):
+                            normalized_btn["url"] = btn["url"]
+                        if btn.get("phone_number"):
+                            normalized_btn["phone_number"] = btn["phone_number"]
+                            
+                        normalized_buttons.append(normalized_btn)
+            
+            # Add BUTTONS component
+            if normalized_buttons:
+                components.append({"type": "BUTTONS", "buttons": normalized_buttons})
+                c["components"] = components
     
     return c
 
@@ -781,6 +848,11 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
     action = str(out.get("agent_action") or "ASK").upper()
     reply = (out.get("message_to_user") or "").strip()
     candidate = out.get("final_creation_payload") or out.get("draft") or {}
+    
+    # Ensure candidate is always a dictionary
+    if not isinstance(candidate, dict):
+        candidate = {}
+    
     mem_update = out.get("memory") or {}
     if mem_update:
         memory = merge_deep(memory, mem_update)
