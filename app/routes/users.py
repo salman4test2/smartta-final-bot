@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, desc
+from sqlalchemy import select, update, desc, func
+from typing import AsyncGenerator
 
 from ..db import SessionLocal
 from ..models import User, UserSession, Session as DBSession
-from ..repo import upsert_user_session
 from ..auth import hash_password, verify_password
 from ..schemas import (
     UserCreate, UserResponse, UserLogin, 
@@ -13,7 +13,7 @@ from ..schemas import (
 
 router = APIRouter(prefix="/users", tags=["users"])
 
-async def get_db() -> AsyncSession:
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with SessionLocal() as s:
         yield s
 
@@ -68,9 +68,11 @@ async def login_user(login_data: UserLogin, db: AsyncSession = Depends(get_db)):
     }
 
 @router.get("/{user_id}/sessions", response_model=UserSessionsResponse)
-async def get_user_sessions(user_id: str, db: AsyncSession = Depends(get_db)):
+async def get_user_sessions(user_id: str, db: AsyncSession = Depends(get_db), 
+                           limit: int = 50, offset: int = 0):
     """
-    Get all sessions created by a specific user, ordered by update time (newest first).
+    Get all sessions created by a specific user, ordered by last activity (newest first).
+    Supports pagination with limit and offset parameters.
     """
     # Verify user exists
     user_result = await db.execute(select(User).where(User.user_id == user_id))
@@ -79,7 +81,7 @@ async def get_user_sessions(user_id: str, db: AsyncSession = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # Get all user sessions with session details
+    # Get all user sessions with session details, ordered by session activity
     query = select(
         UserSession.session_id,
         UserSession.session_name,
@@ -91,10 +93,15 @@ async def get_user_sessions(user_id: str, db: AsyncSession = Depends(get_db)):
         UserSession.__table__.join(DBSession, UserSession.session_id == DBSession.id)
     ).where(
         UserSession.user_id == user_id
-    ).order_by(desc(UserSession.updated_at))
+    ).order_by(desc(DBSession.updated_at)).limit(limit).offset(offset)
     
     result = await db.execute(query)
     sessions_data = result.fetchall()
+    
+    # Get total count for pagination
+    total_query = select(UserSession).where(UserSession.user_id == user_id)
+    total_result = await db.execute(total_query)
+    total_sessions = len(total_result.fetchall())
     
     sessions = []
     for session_data in sessions_data:
@@ -114,7 +121,10 @@ async def get_user_sessions(user_id: str, db: AsyncSession = Depends(get_db)):
     return UserSessionsResponse(
         user_id=user_id,
         sessions=sessions,
-        total_sessions=len(sessions)
+        total_sessions=total_sessions,
+        limit=limit,
+        offset=offset,
+        has_more=len(sessions) == limit and (offset + limit) < total_sessions
     )
 
 @router.put("/{user_id}/sessions/{session_id}/name")
@@ -123,6 +133,7 @@ async def update_session_name(user_id: str, session_id: str,
                               db: AsyncSession = Depends(get_db)):
     """
     Update the name/title of a user session for display purposes.
+    Trims whitespace and updates the updated_at timestamp.
     """
     # Find the user session
     result = await db.execute(
@@ -136,12 +147,15 @@ async def update_session_name(user_id: str, session_id: str,
     if not user_session:
         raise HTTPException(status_code=404, detail="Session not found for this user")
     
-    # Update session name
+    # Trim session name and handle empty strings
+    new_name = (rename_data.session_name or "").strip() or None
+    
+    # Update session name and timestamp
     await db.execute(
         update(UserSession)
         .where(UserSession.user_id == user_id, UserSession.session_id == session_id)
-        .values(session_name=rename_data.session_name)
+        .values(session_name=new_name, updated_at=func.now())
     )
     await db.commit()
     
-    return {"message": "Session name updated successfully", "session_name": rename_data.session_name}
+    return {"message": "Session name updated successfully", "session_name": new_name}

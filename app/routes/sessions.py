@@ -1,9 +1,9 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from ..db import SessionLocal
-from ..models import User, UserSession, Draft, Session as DBSession
+from ..models import User, Draft, Session as DBSession
 from ..repo import get_or_create_session, upsert_user_session
 from ..schemas import SessionCreate, SessionCreateResponse, SessionData, ChatMessage
 
@@ -13,7 +13,7 @@ async def get_db() -> AsyncSession:
     async with SessionLocal() as s:
         yield s
 
-@router.post("/new", response_model=SessionCreateResponse)
+@router.post("/new", response_model=SessionCreateResponse, status_code=status.HTTP_201_CREATED)
 async def new_session_post(session_data: SessionCreate, db: AsyncSession = Depends(get_db)):
     """
     Create a new session with optional name and user association.
@@ -21,7 +21,7 @@ async def new_session_post(session_data: SessionCreate, db: AsyncSession = Depen
     """
     s = await get_or_create_session(db, None)
     
-    session_name = session_data.session_name
+    session_name = (session_data.session_name or "").strip() or None
     user_id = session_data.user_id
     
     # If user_id is provided, create user session association
@@ -30,9 +30,10 @@ async def new_session_post(session_data: SessionCreate, db: AsyncSession = Depen
         user_result = await db.execute(select(User).where(User.user_id == user_id))
         user = user_result.scalar_one_or_none()
         
-        if user:
-            # Create user session association with the provided name using upsert
-            await upsert_user_session(db, user_id, s.id, session_name)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        # Create user session association with the provided name using upsert
+        await upsert_user_session(db, user_id, s.id, session_name)
     
     await db.commit()
     return SessionCreateResponse(
@@ -41,13 +42,19 @@ async def new_session_post(session_data: SessionCreate, db: AsyncSession = Depen
         user_id=user_id
     )
 
-@router.get("/new")
-async def new_session_get(user_id: str = None, db: AsyncSession = Depends(get_db)):
+@router.get("/new", response_model=SessionCreateResponse)
+async def new_session_get(user_id: str | None = None,
+                          session_name: str | None = None,
+                          db: AsyncSession = Depends(get_db)):
     """
     Create a new session (GET method for backward compatibility).
     If user_id is provided, the session will be linked to that user.
+    Supports optional session_name parameter for consistency with POST.
     """
     s = await get_or_create_session(db, None)
+    
+    # Trim session name like in POST
+    session_name = (session_name or "").strip() or None
     
     # If user_id is provided, create user session association
     if user_id:
@@ -55,20 +62,25 @@ async def new_session_get(user_id: str = None, db: AsyncSession = Depends(get_db
         user_result = await db.execute(select(User).where(User.user_id == user_id))
         user = user_result.scalar_one_or_none()
         
-        if user:
-            # Create user session association using upsert
-            await upsert_user_session(db, user_id, s.id, None)
+        if not user:
+            # Keep behavior consistent with POST: fail if user is specified but doesn't exist
+            raise HTTPException(status_code=404, detail="User not found")
+        # Create user session association using upsert
+        await upsert_user_session(db, user_id, s.id, session_name)
     
     await db.commit()
-    return {"session_id": s.id}
+    return SessionCreateResponse(session_id=s.id, session_name=session_name, user_id=user_id)
 
 @router.get("/{session_id}", response_model=SessionData)
 async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
     """
     Retrieve session data including chat history for UI integration.
     Returns messages in chronological order for chat UI display.
+    Returns 404 if session doesn't exist.
     """
-    s = await get_or_create_session(db, session_id)
+    s = await db.get(DBSession, session_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
     
     # Get current draft
     current_draft = {}

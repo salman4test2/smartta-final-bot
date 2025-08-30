@@ -19,8 +19,11 @@ dependencies = [
    "python-dotenv>=1.0.1",
    "orjson>=3.10.7",
    "tenacity>=9.0.0",
-   "openai>=1.45.0"
- ]
+   "openai>=1.45.0",
+   "pytest>=8.4.1",
+   "pytest-asyncio>=1.1.0",
+   "anyio>=4.10.0",
+]
 
 [tool.setuptools]
 packages = ["app"]
