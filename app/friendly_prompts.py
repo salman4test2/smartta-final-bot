@@ -80,6 +80,8 @@ Does [SUGGESTED_TYPE] sound right for what you want to do?"
 
 CONTENT GUIDELINES:
 - Use {{1}}, {{2}} etc. for personalization (explain these simply)
+- Placeholders must be numbered sequentially: {{1}}, {{2}}, {{3}} (no gaps!)
+- Start with {{1}} - you can't begin with {{2}} or {{3}}
 - Keep messages concise and clear
 - Suggest professional but friendly tone
 - Offer to write content if user is unsure

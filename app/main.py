@@ -21,6 +21,7 @@ from .utils import merge_deep, scrub_sensitive_data
 
 # Import route modules
 from .routes import config, debug, users, sessions
+from .interactive import router as interactive_router
 
 app = FastAPI(title="LLM-First WhatsApp Template Builder", version="4.0.0")
 
@@ -29,6 +30,7 @@ app.include_router(config.router)
 app.include_router(debug.router)
 app.include_router(users.router)
 app.include_router(sessions.router)
+app.include_router(interactive_router)
 
 import hashlib
 
@@ -348,6 +350,326 @@ def _slug(s_: str) -> str:
     s_ = re.sub(r"[^a-z0-9_]+", "_", s_)
     return (re.sub(r"_+", "_", s_).strip("_") or "template")[:64]
 
+# --- NLP-powered directive parsing engine ---
+URL_RE   = re.compile(r"(https?://[^\s]+)", re.I)
+PHONE_RE = re.compile(r"(\+?[\d\-\s().]{10,})", re.I)  # More restrictive to avoid false positives
+
+def _syn(cfg, key) -> list[str]:
+    """Get synonym list for a key from config."""
+    return [s.lower() for s in (((cfg.get("nlp") or {}).get("synonyms") or {}).get(key) or [])]
+
+def _tokenize(text: str) -> list[str]:
+    """Tokenize text for intent matching."""
+    return re.findall(r"[A-Za-z0-9_+:/.-]+", (text or "").lower())
+
+def _default_quick_replies(cfg: Dict[str,Any], category: str) -> list[dict]:
+    """Get default quick reply buttons for a category."""
+    cat = (category or "").upper()
+    buttons_config = (cfg.get("components") or {}).get("buttons") or {}
+    defaults_by_cat = buttons_config.get("defaults_by_category") or {}
+    labels = defaults_by_cat.get(cat, defaults_by_cat.get("MARKETING", ["Learn more", "Shop now"]))
+    labels = [str(x).strip()[:25] for x in labels if str(x).strip()]
+    return [{"type":"QUICK_REPLY","text":lbl} for lbl in labels[:3]]
+
+def _extract_int(text: str) -> int | None:
+    """Extract integer from text for length targets, counts, etc."""
+    m = re.search(r"\b(\d{2,4})\b", text)
+    return int(m.group(1)) if m else None
+
+def _extract_brand_name(text: str) -> str | None:
+    """Extract brand/company name from various patterns."""
+    patterns = [
+        # "company name as Sinch" / "add company name as Sinch"
+        r"\b(?:company|brand)\s+name\s+(?:is|as|=)\s+(?P<brand>.+?)(?:\s+(?:in|for|and|with)\b|$)",
+        # "my company is TechStart"
+        r"\bmy\s+(?:company|brand)\s+(?:is|as|=)\s+(?P<brand>.+?)(?:\s+(?:in|for|and|with)\b|$)",
+        # "use Sinch as company name"
+        r"\b(?:use|set|add|include)\s+(?P<brand>.+?)\s+as\s+(?:company|brand)\s+name\b",
+        # "add company name as Sinch"
+        r"\b(?:add|include|insert)\s+(?:company|brand)\s+name\s+as\s+(?P<brand>.+?)(?:\s+(?:in|for|and|with)\b|$)",
+        # "include Sinch as company name"
+        r"\b(?:include|add)\s+(?P<brand>\w+(?:\s+\w+)*)\s+as\s+(?:company|brand)\s+name\b",
+        # "include brand name Acme Corp" - fix for complex phrases
+        r"\b(?:add|include)\s+(?:brand|company)\s+name\s+(?P<brand>\w+(?:\s+\w+)*)(?:\s+(?:in|for|and|with)\b|$)",
+        # Generic "brand Acme" patterns
+        r"\b(?:add|include)\s+(?:brand|company)\s+(?P<brand>\w+(?:\s+\w+)*)\b",
+    ]
+    txt = (text or "").strip()
+    for pat in patterns:
+        m = re.search(pat, txt, re.I)
+        if m:
+            brand = (m.group("brand") or "").strip(' """\'.,;!:')
+            # Remove common trailing words that aren't part of brand name
+            brand = re.split(r"\s+(?:in|for|and|with|to|as)\b", brand)[0].strip()
+            # Filter out single words that are likely not brand names
+            if brand and len(brand) > 1 and not re.match(r'^(name|brand|company)$', brand, re.I): 
+                return brand[:60]
+    
+    # Look for quoted strings as fallback
+    quoted = re.search(r'["""\'](.+?)["""\']', txt)
+    if quoted and len(quoted.group(1)) > 1:
+        return quoted.group(1)[:60].strip()
+    
+    return None
+
+def _ensure_brand_in_body(components: list[dict], brand: str, max_len: int = 1024) -> list[dict]:
+    """Add brand name to BODY component if not already present."""
+    comps = list(components or [])
+    for c in comps:
+        if (c.get("type") or "").upper() == "BODY":
+            text = c.get("text") or ""
+            # Use word boundaries to avoid false positives (e.g., brand in URLs/emails)
+            brand_present = re.search(rf"\b{re.escape(brand)}\b", text, flags=re.IGNORECASE) is not None if brand else True
+            if brand and not brand_present:
+                # append cleanly without breaking placeholders
+                sep = " — " if not text.endswith(("!", ".", "…")) else " "
+                new = (text + sep + brand).strip()
+                c["text"] = new[:max_len]
+            return comps
+    # No BODY yet → just return; we'll store brand in memory to re-apply later
+    return comps
+
+def _shorten_text(text: str, target: int = 140) -> str:
+    """Intelligently shorten text to target length."""
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if len(t) <= target: return t
+    sentences = re.split(r"(?<=[.!?])\s+", t)
+    acc = ""
+    for s in sentences:
+        if len(acc) + len(s) + (1 if acc else 0) <= target:
+            acc = (acc + " " + s).strip()
+        else:
+            break
+    if acc: return acc
+    cut = t[:target].rsplit(" ", 1)[0]
+    return (cut + "…") if cut else t[:target]
+
+def _parse_user_directives(cfg: Dict[str,Any], text: str) -> list[dict]:
+    """Parse user text and return normalized directives."""
+    toks = _tokenize(text)
+    text_lower = text.lower()
+    s_add, s_btn, s_url, s_phone = _syn(cfg,"add"), _syn(cfg,"button"), _syn(cfg,"url"), _syn(cfg,"phone")
+    s_brand, s_shorten = _syn(cfg,"brand"), _syn(cfg,"shorten")
+    s_header, s_footer, s_body, s_name = _syn(cfg,"header"), _syn(cfg,"footer"), _syn(cfg,"body"), _syn(cfg,"name")
+
+    directives: list[dict] = []
+
+    # Buttons (improved detection with multiple patterns)
+    button_indicators = (
+        any(w in toks for w in s_btn) or 
+        any(w in toks for w in s_add) and any(btn in text_lower for btn in ["button", "buttons", "cta", "action"]) or
+        any(phrase in text_lower for phrase in ["quick repl", "call-to-action", "reply option"]) or
+        re.search(r"\bcall\s+us\b", text_lower)  # "call us" patterns
+    )
+    
+    if button_indicators:
+        url = URL_RE.search(text)
+        phone = PHONE_RE.search(text)
+        
+        # Enhanced phone detection for "call us" patterns
+        if not phone and re.search(r"\bcall\s+us\b", text_lower):
+            # Look for phone numbers in context
+            phone_patterns = [
+                r"call\s+us\s+(?:at\s+)?(\+?[\d\-\s().]{10,})",
+                r"(\+?[\d\-\s().]{10,})",  # Any phone-like number
+            ]
+            for pattern in phone_patterns:
+                match = re.search(pattern, text, re.I)
+                if match:
+                    phone = match
+                    break
+        
+        count = _extract_int(text) or 0
+        kind = "quick" if not url and not phone else ("url" if url else "phone")
+        
+        # Extract phone number correctly
+        phone_num = None
+        if phone:
+            if hasattr(phone, 'groups') and phone.groups():
+                phone_num = phone.group(1) if len(phone.groups()) >= 1 else phone.group(0)
+            else:
+                phone_num = phone.group(0)
+        
+        directives.append({"type":"add_buttons","kind":kind,"url": url.group(0) if url else None,
+                           "phone": phone_num, "count": count})
+
+    # Brand / company name (improved detection)
+    brand_indicators = (
+        any(w in toks for w in s_brand) or
+        any(phrase in text_lower for phrase in ["company name", "brand name", "organization"]) or
+        re.search(r"\b(?:company|brand|name)\b", text_lower)
+    )
+    
+    if brand_indicators:
+        brand = _extract_brand_name(text)
+        if brand:
+            directives.append({"type":"set_brand","name":brand})
+
+    # Shorten (optionally with target) - improved multi-intent detection
+    shorten_indicators = (
+        any(w in toks for w in s_shorten) or
+        any(phrase in text_lower for phrase in ["make it short", "make it shorter", "condense", "trim", "reduce length", "shorter"]) or
+        re.search(r"\bmake\s+it\s+short", text_lower)
+    )
+    
+    if shorten_indicators:
+        target = _extract_int(text) or (((cfg.get("components") or {}).get("text") or {}).get("shorten", {}).get("target_length", 140))
+        directives.append({"type":"shorten","target": int(target)})
+
+    # Header / Footer / Body / Name (generic setters if user pasted exact copy)
+    if any(w in toks for w in s_name):
+        m = re.search(r'name\s*(?:is|=|as)?\s*[""]?([a-z0-9_]{1,64})[""]?', text, re.I)
+        if m: directives.append({"type":"set_name","name":m.group(1)})
+    if any(w in toks for w in s_body):
+        m = re.search(r'(?:body|message|text|content)\s*(?:is|=|:)\s*[""](.+?)[""]', text, re.I|re.S)
+        if m: directives.append({"type":"set_body","text":m.group(1).strip()})
+    if any(w in toks for w in s_header):
+        # accept "header: XXX" → TEXT header
+        m = re.search(r'header\s*(?:is|=|:)\s*[""](.+?)[""]', text, re.I|re.S)
+        if m: directives.append({"type":"set_header","format":"TEXT","text":m.group(1).strip()})
+    if any(w in toks for w in s_footer):
+        m = re.search(r'footer\s*(?:is|=|:)\s*[""](.+?)[""]', text, re.I|re.S)
+        if m: directives.append({"type":"set_footer","text":m.group(1).strip()})
+
+    return directives
+
+def _apply_directives(cfg: Dict[str,Any], directives: list[dict], candidate: Dict[str,Any], memory: Dict[str,Any]) -> tuple[Dict[str,Any], list[str]]:
+    """Apply normalized directives in a category-safe, schema-safe way."""
+    out = dict(candidate or {})
+    comps = list(out.get("components") or [])
+    cat  = (out.get("category") or memory.get("category") or "").upper()
+    msgs: list[str] = []
+
+    def _ensure_buttons():
+        return next((c for c in comps if (c.get("type") or "").upper()=="BUTTONS"), None)
+
+    for d in directives:
+        t = d.get("type")
+
+        # 1) add_buttons
+        if t == "add_buttons":
+            if cat == "AUTHENTICATION":
+                msgs.append("Buttons aren't allowed for AUTH templates; skipped.")
+                continue
+            btn_block = _ensure_buttons()
+            if not btn_block:
+                btn_block = {"type":"BUTTONS","buttons":[]}
+                comps.append(btn_block)
+            buttons = btn_block["buttons"]
+
+            kind = d.get("kind")
+            count = max(1, min(3, int(d.get("count") or 0))) if kind == "quick" else 1
+
+            if kind == "url":
+                url = d.get("url")
+                if url:
+                    buttons.append({"type":"URL","text":"Visit Website","url":url})
+                    msgs.append("Added URL button.")
+                else:
+                    msgs.append("Couldn't find a URL; added quick replies instead.")
+                    buttons.extend(_default_quick_replies(cfg, cat))
+            elif kind == "phone":
+                phone = d.get("phone")
+                if phone:
+                    buttons.append({"type":"PHONE_NUMBER","text":"Call Us","phone_number":phone})
+                    msgs.append("Added phone button.")
+                else:
+                    msgs.append("Couldn't find a phone number; added quick replies instead.")
+                    buttons.extend(_default_quick_replies(cfg, cat))
+            else:
+                qrs = _default_quick_replies(cfg, cat)
+                if count and count < len(qrs): qrs = qrs[:count]
+                if qrs:
+                    buttons.extend(qrs)
+                    msgs.append(f"Added {len(qrs)} quick replies.")
+                else:
+                    # Fallback if no defaults configured
+                    fallback_buttons = [{"type":"QUICK_REPLY","text":"Learn More"}, {"type":"QUICK_REPLY","text":"Contact Us"}]
+                    buttons.extend(fallback_buttons)
+                    msgs.append(f"Added {len(fallback_buttons)} quick replies.")
+            out["components"] = comps
+
+        # 2) set_brand
+        elif t == "set_brand":
+            brand = (d.get("name") or "").strip()
+            if not brand: continue
+            memory["brand_name"] = brand
+            new_comps = _ensure_brand_in_body(comps, brand)
+            if new_comps is comps:
+                # BODY missing → defer
+                memory["brand_name_pending"] = brand
+                msgs.append(f"Stored brand \"{brand}\"; will add when BODY is present.")
+            else:
+                comps = new_comps
+                msgs.append(f'Added company name "{brand}" to BODY.')
+            out["components"] = comps
+
+        # 3) shorten
+        elif t == "shorten":
+            target = int(d.get("target") or ((cfg.get("components") or {}).get("text") or {}).get("shorten", {}).get("target_length", 140))
+            for c in comps:
+                if (c.get("type") or "").upper() == "BODY" and (c.get("text") or "").strip():
+                    c["text"] = _shorten_text(c["text"], target)
+                    msgs.append(f"Shortened BODY to ≈{target} chars.")
+                    break
+            out["components"] = comps
+
+        # 4) set_name
+        elif t == "set_name":
+            out["name"] = _slug(d.get("name"))
+
+        # 5) set_body
+        elif t == "set_body":
+            txt = (d.get("text") or "").strip()
+            if txt:
+                # Insert/replace first BODY
+                replaced = False
+                for c in comps:
+                    if (c.get("type") or "").upper() == "BODY":
+                        c["text"] = txt
+                        replaced = True
+                        break
+                if not replaced:
+                    comps.insert(0, {"type":"BODY","text":txt})
+                # If brand was pending, inject now
+                if memory.get("brand_name_pending"):
+                    comps = _ensure_brand_in_body(comps, memory.pop("brand_name_pending"))
+                out["components"] = comps
+                msgs.append("Updated BODY.")
+
+        # 6) set_header
+        elif t == "set_header":
+            fmt = (d.get("format") or "TEXT").upper()
+            if cat == "AUTHENTICATION" and fmt != "TEXT":
+                msgs.append("For AUTH, only TEXT header is allowed; skipped non-TEXT header.")
+                continue
+            # remove any existing header (only 0–1 allowed)
+            comps = [c for c in comps if (c.get("type") or "").upper() != "HEADER"]
+            h = {"type":"HEADER","format":fmt}
+            if fmt == "TEXT":
+                txt = (d.get("text") or "").strip()
+                if txt: h["text"] = txt[:60]
+            out["components"] = [h] + comps
+            msgs.append("Updated HEADER.")
+
+        # 7) set_footer
+        elif t == "set_footer":
+            txt = (d.get("text") or "").strip()
+            # replace or append
+            seen = False
+            for c in comps:
+                if (c.get("type") or "").upper() == "FOOTER":
+                    c["text"] = txt[:60]
+                    seen = True
+                    break
+            if not seen: comps.append({"type":"FOOTER","text":txt[:60]})
+            out["components"] = comps
+            msgs.append("Updated FOOTER.")
+
+    return out, msgs
+
+# --- End of directive parsing engine ---
+
 def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(cand, dict):
         return {}
@@ -407,10 +729,16 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
                 txt = (comp.get("text") or "").strip()
                 if not fmt and txt:
                     fmt = "TEXT"
+                
                 if fmt == "TEXT" and txt:
-                    clean.append({"type": "HEADER", "format": "TEXT", "text": txt})
-                elif fmt in {"IMAGE","VIDEO","DOCUMENT"}:
+                    item = {"type": "HEADER", "format": "TEXT", "text": txt}
+                    # Preserve example for TEXT headers with variables
+                    if "example" in comp:
+                        item["example"] = comp["example"]
+                    clean.append(item)
+                elif fmt in {"IMAGE", "VIDEO", "DOCUMENT", "LOCATION"}:
                     item = {"type": "HEADER", "format": fmt}
+                    # Always preserve example for media headers (required for most, optional for LOCATION)
                     if "example" in comp:
                         item["example"] = comp["example"]
                     clean.append(item)
@@ -610,7 +938,13 @@ def _compute_missing(p: Dict[str, Any], memory: Dict[str, Any]) -> List[str]:
     # Extras only when allowed AND not skipped
     cat = (p.get("category") or memory.get("category") or "").upper()
     skip_extras = (memory.get("extras_choice") == "skip")
-    if cat != "AUTHENTICATION" and not skip_extras:
+    
+    if cat == "AUTHENTICATION":
+        # For AUTH, only allow TEXT header if explicitly requested
+        if memory.get("wants_header") and not _has_component(p, "HEADER"):
+            miss.append("header")
+    elif not skip_extras:
+        # For non-AUTH categories, allow all extras if not skipped
         if memory.get("wants_header") and not _has_component(p, "HEADER"):
             miss.append("header")
         if memory.get("wants_footer") and not _has_component(p, "FOOTER"):
@@ -663,31 +997,44 @@ def _auto_apply_extras_on_yes(user_text: str, candidate: Dict[str, Any], memory:
     cand = dict(candidate or {})
     comps = list((cand.get("components") or []))
 
-    # block extras for AUTHENTICATION
-    cat = (memory.get("category") or cand.get("category") or "").upper()
-    if cat == "AUTHENTICATION":
-        return cand
-
     def has(kind: str) -> bool:
         return any(isinstance(c, dict) and (c.get("type") or "").upper() == kind for c in comps)
 
     changed = False
+    cat = (memory.get("category") or cand.get("category") or "").upper()
+    
+    # For AUTHENTICATION category, allow TEXT header if user specifically requests it
     if memory.get("wants_header") and not has("HEADER"):
-        hdr = (memory.get("event_label") or "Special offer just for you!")[:60]
-        comps.insert(0, {"type": "HEADER", "format": "TEXT", "text": hdr})
-        changed = True
-    if memory.get("wants_footer") and not has("FOOTER"):
-        comps.append({"type":"FOOTER","text":"Thank you!"})
-        changed = True
-    if memory.get("wants_buttons") and not has("BUTTONS"):
-        comps.append({
-            "type":"BUTTONS",
-            "buttons":[
-                {"type":"QUICK_REPLY","text":"View offers"},
-                {"type":"QUICK_REPLY","text":"Order now"}
-            ]
-        })
-        changed = True
+        if cat == "AUTHENTICATION":
+            # Only add TEXT header for AUTHENTICATION category
+            hdr = (memory.get("event_label") or "Authentication code")[:60]
+            comps.insert(0, {"type": "HEADER", "format": "TEXT", "text": hdr})
+            changed = True
+        elif cat != "AUTHENTICATION":
+            # For non-AUTH categories, use default behavior
+            hdr = (memory.get("event_label") or "Special offer just for you!")[:60]
+            comps.insert(0, {"type": "HEADER", "format": "TEXT", "text": hdr})
+            changed = True
+    
+    # Block footer and buttons for AUTHENTICATION
+    if cat != "AUTHENTICATION":
+        if memory.get("wants_footer") and not has("FOOTER"):
+            comps.append({"type":"FOOTER","text":"Thank you!"})
+            changed = True
+        if memory.get("wants_buttons") and not has("BUTTONS"):
+            # Use configuration-driven defaults instead of hardcoded labels
+            from .config import get_config
+            cfg = get_config() or {}
+            defaults = (cfg.get("components", {})
+                          .get("buttons", {})
+                          .get("defaults_by_category", {})
+                          .get(cat, ["Learn more", "Shop now"]))
+            comps.append({
+                "type":"BUTTONS",
+                "buttons":[{"type":"QUICK_REPLY","text":t} for t in defaults[:2]]
+            })
+            changed = True
+    
     if changed:
         cand["components"] = comps
     return cand
@@ -900,6 +1247,26 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
 
         d.draft = merged
 
+        # Parse and apply robust directives from user text (multi-intent, config-driven)
+        directives = _parse_user_directives(cfg, safe_message)
+        msgs_applied = []
+        if directives:
+            merged2, msgs_applied = _apply_directives(cfg, directives, merged, memory)
+            if merged2 != merged:
+                merged = merged2
+                d.draft = merged
+                # refresh memory if brand pending was set
+                s.memory = memory
+
+        # If brand was pending and BODY appeared via LLM later, inject it automatically
+        if memory.get("brand_name_pending"):
+            has_body = any((c.get("type") or "").upper()=="BODY" for c in (merged.get("components") or []))
+            if has_body:
+                merged["components"] = _ensure_brand_in_body(merged.get("components") or [], memory.pop("brand_name_pending"))
+                d.draft = merged
+                s.memory = memory
+                msgs_applied = (msgs_applied or []) + ["Added stored brand to BODY."]
+
         # Trust LLM for guidance but correct it with actual state
         llm_missing = (out.get("missing") or [])
         computed_missing = _compute_missing(merged, memory)
@@ -925,6 +1292,10 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
             s.memory = memory
 
         final_reply = (reply or _targeted_missing_reply(missing, memory)).strip()
+
+        # If we applied deterministic edits and the LLM reply is generic, override with a helpful confirmation
+        if (msgs_applied) and (not reply or reply.strip().lower().startswith("please tell me more")):
+            final_reply = "; ".join(msgs_applied) + " Anything else to add?"
 
         # Add encouragement and examples from friendly_prompts when appropriate
         if len(msgs) > 0 and any(extras_present.values()):
@@ -960,9 +1331,25 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         def _has_component_kind(p: Dict[str, Any], kind: str) -> bool:
             return any(isinstance(c, dict) and (c.get("type") or "").upper() == kind for c in (p.get("components") or []))
 
+        # Pre-FINAL guard: For AUTHENTICATION category, reject non-TEXT headers
+        cat = (candidate.get("category") or memory.get("category") or "").upper()
+        if cat == "AUTHENTICATION":
+            for comp in (candidate.get("components") or []):
+                if isinstance(comp, dict) and (comp.get("type") or "").upper() == "HEADER":
+                    header_format = (comp.get("format") or "").upper()
+                    if header_format and header_format != "TEXT":
+                        d.draft = merge_deep(draft, candidate)
+                        s.last_action = "ASK"
+                        error_msg = f"Authentication templates only allow TEXT headers, not {header_format}. Please use a simple text header or remove the header component."
+                        s.data = {**(s.data or {}), "messages": _append_history(inp.message, error_msg)}
+                        await touch_user_session(db, inp.user_id, s.id)
+                        await upsert_session(db, s); await db.commit()
+                        return ChatResponse(session_id=s.id, reply=error_msg, draft=d.draft,
+                                            missing=_compute_missing(d.draft, memory),
+                                            final_creation_payload=None)
+
         # enforce requested extras before validate (only for non-AUTH categories)
         missing_extras = []
-        cat = (candidate.get("category") or memory.get("category") or "").upper()
         if cat != "AUTHENTICATION":
             if memory.get("wants_header") and not _has_component_kind(candidate, "HEADER"):
                 missing_extras.append("header")

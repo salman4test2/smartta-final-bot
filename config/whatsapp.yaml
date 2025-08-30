@@ -1,6 +1,21 @@
 model: gpt-4o-mini
 temperature: 0.2
 
+# NLP configuration for intent parsing and synonyms
+nlp:
+  synonyms:
+    add: ["add","include","insert","attach","create","put","append","make","give","provide"]
+    button: ["button","buttons","cta","quick reply","quick replies","reply option","action","actions"]
+    url: ["url","link","website","web","open","visit"]
+    phone: ["phone","call","contact","dial","ring"]
+    brand: ["brand","company","org","organization","business","sender","brand name","company name"]
+    header: ["header","title","heading"]
+    footer: ["footer","sign-off","signature"]
+    shorten: ["shorten","shorter","make it short","condense","trim","crisper","concise","brief","reduce"]
+    name: ["name","title","template name"]
+    body: ["body","message","text","content","copy"]
+  languages: ["en","hi","es"]
+
 history:
   max_turns: 200
   log_llm_io: true  # your code logs regardless; this is just a hint
@@ -43,6 +58,58 @@ creation_payload_schema:
                 phone_number: { type: string }
                 payload: { type: string }
   additionalProperties: false
+  allOf:
+    # Header format conditionals: TEXT requires text, media forbids text
+    - if:
+        properties:
+          components:
+            contains:
+              allOf:
+                - properties: { type: { const: HEADER } }
+                - properties: { format: { const: TEXT } }
+      then:
+        properties:
+          components:
+            contains:
+              allOf:
+                - properties: { type: { const: HEADER } }
+                - properties: { format: { const: TEXT } }
+                - required: [text]
+    # Non-TEXT headers must not have text field
+    - if:
+        properties:
+          components:
+            contains:
+              allOf:
+                - properties: { type: { const: HEADER } }
+                - properties: { format: { enum: [IMAGE, VIDEO, DOCUMENT, LOCATION] } }
+      then:
+        properties:
+          components:
+            contains:
+              allOf:
+                - properties: { type: { const: HEADER } }
+                - properties: { format: { enum: [IMAGE, VIDEO, DOCUMENT, LOCATION] } }
+                - not: { required: [text] }
+    # AUTHENTICATION category restrictions
+    - if:
+        properties: { category: { const: AUTHENTICATION } }
+      then:
+        properties:
+          components:
+            allOf:
+              # No FOOTER allowed
+              - not:
+                  contains: { properties: { type: { const: FOOTER } } }
+              # No BUTTONS allowed  
+              - not:
+                  contains: { properties: { type: { const: BUTTONS } } }
+              # Only TEXT headers allowed (if header present)
+              - not:
+                  contains:
+                    allOf:
+                      - properties: { type: { const: HEADER } }
+                      - properties: { format: { enum: [IMAGE, VIDEO, DOCUMENT, LOCATION] } }
 
 lint_rules:
   # Lengths (Meta norms)
@@ -72,7 +139,78 @@ lint_rules:
   category_constraints:
     AUTHENTICATION:
       allow_buttons: false
+      allow_footer: false  # AUTH templates should not have footers
       allow_media_header: false
+      allowed_header_formats: [TEXT]  # Only TEXT headers allowed for AUTH
+    MARKETING:
+      allow_buttons: true
+      allow_footer: true
+      allowed_header_formats: [TEXT, IMAGE, VIDEO, DOCUMENT, LOCATION]
+    UTILITY:
+      allow_buttons: true
+      allow_footer: true
+      allowed_header_formats: [TEXT, IMAGE, VIDEO, DOCUMENT, LOCATION]
+
+  # Header format validation
+  header_formats:
+    TEXT:
+      max_length: 60
+      max_variables: 1
+      require_text: true
+    IMAGE:
+      require_example: true
+      forbid_text: true
+    VIDEO:
+      require_example: true
+      forbid_text: true
+    DOCUMENT:
+      require_example: true
+      forbid_text: true
+    LOCATION:
+      require_example: false  # Optional for LOCATION
+      forbid_text: true
+
+  # Components configuration (future-proof header config block)
+  components:
+    buttons:
+      defaults_by_category:
+        MARKETING: ["Learn more", "Shop now"]
+        UTILITY: ["View status", "Help"]
+        AUTHENTICATION: []  # buttons not allowed anyway
+    text:
+      shorten:
+        enabled: true
+        target_length: 140
+    header:
+      formats:
+        TEXT:
+          max_length: 60
+          max_variables: 1
+          require_text: true
+          variable_example_required: true
+        IMAGE:
+          require_example: true
+          forbid_text: true
+          allowed_mime_types: ["image/jpeg", "image/png"]
+        VIDEO:
+          require_example: true
+          forbid_text: true
+          allowed_mime_types: ["video/mp4", "video/3gpp"]
+        DOCUMENT:
+          require_example: true
+          forbid_text: true
+          allowed_mime_types: ["application/pdf", "text/plain"]
+        LOCATION:
+          require_example: false
+          forbid_text: true
+          master_switch: true  # LOCATION is master format
+      category_restrictions:
+        AUTHENTICATION:
+          allowed_formats: ["TEXT"]
+        MARKETING:
+          allowed_formats: ["TEXT", "IMAGE", "VIDEO", "DOCUMENT", "LOCATION"]
+        UTILITY:
+          allowed_formats: ["TEXT", "IMAGE", "VIDEO", "DOCUMENT", "LOCATION"]
 
   # Disallowed links (safety/compliance)
   forbidden_links:

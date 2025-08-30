@@ -114,3 +114,58 @@ class SuccessResponse(BaseModelWithConfig):
     """Standard success response format"""
     success: bool = True
     message: Optional[str] = None
+
+# Interactive Mode Schemas
+class FieldDescriptor(BaseModel):
+    """Describes a field in the interactive template builder."""
+    id: str
+    label: str
+    required: bool
+    can_delete: bool
+    can_generate: bool
+    value: Optional[Any] = None
+    meta: Dict[str, Any] = {}
+
+class InteractiveStartRequest(BaseModel):
+    """Request to start interactive template creation."""
+    intent: str
+    session_id: Optional[str] = None
+    user_id: Optional[str] = None
+
+class InteractiveSetCategoryRequest(BaseModel):
+    """Request to set template category."""
+    session_id: str
+    category: str
+
+class FieldUpsertRequest(BaseModel):
+    """Request to update a field value."""
+    session_id: str
+    field_id: str
+    value: Any
+
+class FieldGenerateRequest(BaseModel):
+    """Request to generate content for a field."""
+    session_id: str
+    field_id: str
+    hints: Optional[str] = None
+    brand: Optional[str] = None
+
+class FieldDeleteRequest(BaseModel):
+    """Request to delete an optional field."""
+    session_id: str
+    field_id: str
+
+class InteractiveStateResponse(BaseModel):
+    """Response containing the current interactive state."""
+    session_id: str
+    needs_category: bool
+    fields: List[FieldDescriptor]
+    draft: Dict[str, Any]
+    issues: List[str] = []
+    missing: List[str] = []
+
+class FinalizeResponse(BaseModel):
+    """Response for template finalization."""
+    ok: bool
+    issues: List[str]
+    payload: Optional[Dict[str, Any]] = None
