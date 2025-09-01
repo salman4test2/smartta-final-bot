@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Any, Dict, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from .models import Session, Draft, LlmLog
+from .models import Session, Draft, LlmLog, UserBusinessProfile
 
 async def get_or_create_session(db: AsyncSession, sid: Optional[str]) -> Session:
     if sid:
@@ -120,3 +120,35 @@ async def touch_user_session(db: AsyncSession, user_id: str, session_id: str):
             session_name=None
         )
         db.add(new_user_session)
+
+async def get_user_business_profile(db: AsyncSession, user_id: str) -> Optional[UserBusinessProfile]:
+    """Get user's business profile"""
+    from sqlalchemy import select
+    
+    result = await db.execute(
+        select(UserBusinessProfile).where(UserBusinessProfile.user_id == user_id)
+    )
+    return result.scalar_one_or_none()
+
+async def upsert_user_business_profile(db: AsyncSession, user_id: str, profile_data: Dict[str, Any]) -> UserBusinessProfile:
+    """Create or update user's business profile"""
+    from sqlalchemy import select
+    
+    # Check if profile exists
+    result = await db.execute(
+        select(UserBusinessProfile).where(UserBusinessProfile.user_id == user_id)
+    )
+    profile = result.scalar_one_or_none()
+    
+    if profile:
+        # Update existing profile
+        for key, value in profile_data.items():
+            if hasattr(profile, key):
+                setattr(profile, key, value)
+    else:
+        # Create new profile
+        profile = UserBusinessProfile(user_id=user_id, **profile_data)
+        db.add(profile)
+    
+    await db.flush()
+    return profile

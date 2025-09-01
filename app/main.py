@@ -10,7 +10,7 @@ import datetime as dt
 
 from .db import engine, SessionLocal, Base
 from .models import Draft, User, UserSession
-from .repo import get_or_create_session, upsert_session, create_draft, log_llm, upsert_user_session, touch_user_session
+from .repo import get_or_create_session, upsert_session, create_draft, log_llm, upsert_user_session, touch_user_session, get_user_business_profile, upsert_user_business_profile
 from .config import get_config, get_cors_origins, is_production
 from .prompts import build_system_prompt, build_context_block, build_friendly_system_prompt
 from .llm import LlmClient
@@ -1256,6 +1256,31 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
     memory: Dict[str, Any] = dict(s.memory or {})
     msgs: List[Dict[str, str]] = (s.data or {}).get("messages", [])
 
+    # Load user business profile to avoid asking repeated questions
+    from .repo import get_user_business_profile
+    user_profile = await get_user_business_profile(db, inp.user_id)
+    
+    # Pre-populate memory from user profile if available
+    if user_profile:
+        if not memory.get("business_name") and user_profile.business_name:
+            memory["business_name"] = user_profile.business_name
+            memory["brand_name"] = user_profile.business_name
+        
+        if not memory.get("business_type") and user_profile.business_type:
+            memory["business_type"] = user_profile.business_type
+        
+        if not draft.get("category") and user_profile.default_category:
+            memory["preferred_category"] = user_profile.default_category
+        
+        if not draft.get("language") and user_profile.default_language:
+            memory["preferred_language"] = user_profile.default_language
+        
+        if user_profile.phone_number:
+            memory["business_phone"] = user_profile.phone_number
+        
+        if user_profile.website_url:
+            memory["business_website"] = user_profile.website_url
+
     # 2) Build LLM inputs + call
     # Use friendly system prompt for better user experience
     system = build_friendly_system_prompt(cfg)
@@ -1616,6 +1641,10 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         s.data = {**(s.data or {}), "messages": _append_history(inp.message, reply or "Finalized.")}
         await touch_user_session(db, inp.user_id, s.id)
         await upsert_session(db, s); await db.commit()
+        
+        # Save business profile on successful completion
+        await _save_business_profile_if_present(db, inp.user_id, memory)
+        
         return ChatResponse(session_id=s.id, reply=reply or "Finalized.", draft=d.draft,
                             missing=[], final_creation_payload=candidate_for_validation)
 
@@ -1649,6 +1678,10 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
     s.data = {**(s.data or {}), "messages": _append_history(inp.message, final_reply)}
     await touch_user_session(db, inp.user_id, s.id)
     await upsert_session(db, s); await db.commit()
+    
+    # Save business profile if we have business context
+    await _save_business_profile_if_present(db, inp.user_id, memory)
+    
     return ChatResponse(session_id=s.id, reply=final_reply, draft=final_draft,
                         missing=missing, final_creation_payload=None)
 
@@ -1857,5 +1890,34 @@ def _redact_secrets(data: Any) -> Any:
         return [_redact_secrets(item) for item in data]
     else:
         return data
+
+async def _save_business_profile_if_present(db: AsyncSession, user_id: str, memory: Dict[str, Any]):
+    """Helper to save business profile from memory if present."""
+    if not user_id or not memory:
+        return
+        
+    try:
+        business_data = {}
+        
+        # Extract business information from memory
+        if memory.get("business_name"):
+            business_data["business_name"] = memory["business_name"]
+        if memory.get("business_type"):
+            business_data["business_type"] = memory["business_type"]
+        if memory.get("brand_name"):
+            business_data["brand_name"] = memory["brand_name"]
+        if memory.get("industry"):
+            business_data["industry"] = memory["industry"]
+        if memory.get("category"):
+            business_data["category"] = memory["category"]
+        if memory.get("language_pref"):
+            business_data["language_preference"] = memory["language_pref"]
+        
+        # Save to business profile if we have meaningful data
+        if business_data:
+            await upsert_user_business_profile(db, user_id, business_data)
+    except Exception as e:
+        # Don't fail the chat if business profile saving fails
+        print(f"Warning: Could not save business profile: {e}")
 
 

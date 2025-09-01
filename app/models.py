@@ -158,6 +158,55 @@ class LlmLog(Base):
     )
 
 
+class UserBusinessProfile(Base):
+    __tablename__ = "user_business_profiles"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    
+    # Foreign key to users table
+    user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    
+    # Business information
+    business_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    business_type: Mapped[str | None] = mapped_column(String(100), nullable=True)  # restaurant, salon, clinic, etc.
+    industry: Mapped[str | None] = mapped_column(String(100), nullable=True)  # hospitality, healthcare, retail, etc.
+    
+    # Default preferences
+    default_category: Mapped[str | None] = mapped_column(String(50), nullable=True)  # MARKETING, UTILITY, AUTHENTICATION
+    default_language: Mapped[str | None] = mapped_column(String(10), nullable=True)  # en_US, es_ES, etc.
+    
+    # Contact information
+    phone_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    website_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    
+    # Additional metadata as JSON
+    metadata: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+    
+    # Ensure one profile per user
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_user_business_profile_user_id"),
+        Index("idx_user_business_profiles_user_id", "user_id"),
+        Index("idx_user_business_profiles_business_type", "business_type"),
+    )
+
+
 # Helpful indexes (portable)
 Index("ix_sessions_updated_at", Session.updated_at)
 Index("ix_drafts_session_created_at", Draft.session_id, Draft.created_at)
