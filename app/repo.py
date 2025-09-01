@@ -36,10 +36,28 @@ async def log_llm(db: AsyncSession, session_id: str, direction: str, payload: Di
     db.add(LlmLog(session_id=session_id, direction=direction, payload=payload, model=model, latency_ms=latency_ms))
     await db.flush()
 
+async def ensure_user_exists(db: AsyncSession, user_id: str):
+    """Ensure a user exists, creating one if it doesn't"""
+    from sqlalchemy import select
+    from .models import User
+    
+    # Check if user exists
+    result = await db.execute(select(User).where(User.user_id == user_id))
+    existing_user = result.scalar_one_or_none()
+    
+    if not existing_user:
+        # Create user with a default password (in production this should be handled properly)
+        new_user = User(user_id=user_id, password="default")
+        db.add(new_user)
+        await db.flush()
+
 async def upsert_user_session(db: AsyncSession, user_id: str, session_id: str, session_name: str = None):
     """Create or update a user session association"""
     from sqlalchemy import select, update, func
     from .models import UserSession
+    
+    # Ensure user exists first
+    await ensure_user_exists(db, user_id)
     
     # Check if user session association already exists
     result = await db.execute(
@@ -74,6 +92,9 @@ async def touch_user_session(db: AsyncSession, user_id: str, session_id: str):
         
     from sqlalchemy import select, update, func
     from .models import UserSession
+    
+    # Ensure user exists first
+    await ensure_user_exists(db, user_id)
     
     # Check if user session association exists
     user_session_result = await db.execute(

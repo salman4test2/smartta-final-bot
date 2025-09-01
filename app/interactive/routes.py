@@ -31,44 +31,55 @@ async def get_db():
         yield s
 
 # Field generation system prompt
-FIELD_SYSTEM_PROMPT = """You are an assistant that generates ONE field for a WhatsApp template payload that must be valid for Meta's Cloud API.
+FIELD_SYSTEM_PROMPT = """You are a smart assistant that generates contextually relevant WhatsApp template fields.
 
-Rules:
-- Obey the category rules:
-  - MARKETING/UTILITY: HEADER formats allowed = TEXT, IMAGE, VIDEO, DOCUMENT, LOCATION
-  - AUTHENTICATION: HEADER format allowed = TEXT only
-- If generating Header TEXT:
-  - <= 60 characters, <= 1 {{n}} placeholder. Provide a concise title.
-- If generating Body:
-  - Keep it short, friendly, and brand-safe; use {{n}} placeholders if needed.
-- If generating Buttons:
-  - Use QUICK_REPLY texts only (no URL/phone here). Keep 1–3 short options.
-- If generating Footer:
-  - Keep it short.
-- Never invent disallowed fields for the category.
-- Respect the provided config constraints and examples in the context.
-- Return STRICT JSON with only the requested field shape (do not wrap or add commentary).
+CONTEXT AWARENESS:
+- Use the brand name, category, and existing content to create relevant fields
+- For businesses like "sweet shop", "restaurant", "clinic" - create industry-specific content
+- Avoid generic labels like "Learn more", "Shop now" unless they fit the context
+- Make buttons actionable and specific to the business type
 
-You will receive JSON context:
+RULES:
+- MARKETING/UTILITY: HEADER formats = TEXT, IMAGE, VIDEO, DOCUMENT, LOCATION
+- AUTHENTICATION: HEADER format = TEXT only
+- Header TEXT: ≤60 chars, ≤1 {{n}} placeholder
+- Body: Keep contextual, friendly, use {{n}} placeholders appropriately 
+- Buttons: 2-3 QUICK_REPLY options, specific to business context
+- Footer: Short, brand-appropriate
+
+BUSINESS-SPECIFIC EXAMPLES:
+- Sweet shop: "Order sweets", "View menu", "Call store"
+- Restaurant: "Book table", "View menu", "Order now"  
+- Clinic: "Book appointment", "Call clinic", "Get directions"
+- Fashion: "Shop collection", "Size guide", "Track order"
+- Service: "Get quote", "Schedule visit", "Contact us"
+
+BUTTON GENERATION STRATEGY:
+1. Look at brand name and category to understand business type
+2. Check existing body content for context clues
+3. Create 2-3 relevant, actionable buttons
+4. Avoid duplicate or generic labels
+5. Make buttons feel natural for that business
+
+JSON CONTEXT:
 {
   "category": "...",
-  "language": "...",
-  "brand": "...",
-  "field_id": "...",        // which field to produce
-  "current_payload": {...}, // partial template
-  "config": {...},          // allowed formats, limits
-  "hints": "...",           // optional guidance from user
+  "language": "...", 
+  "brand": "...",           // Use this for context!
+  "field_id": "...",        
+  "current_payload": {...}, // Check existing content
+  "config": {...},          
+  "hints": "...",           // User guidance
+  "business_context": "..." // Additional business info
 }
 
-Output:
-- JSON object for that field ONLY.
-  Examples:
-  - For header TEXT: {"type":"HEADER","format":"TEXT","text":"<≤60 chars>"}
-  - For header IMAGE: {"type":"HEADER","format":"IMAGE","example":"<media-id-or-url>"}
-  - For body: {"type":"BODY","text":"Hi {{1}}, ..."}
-  - For buttons: {"type":"BUTTONS","buttons":[{"type":"QUICK_REPLY","text":"..."}]}
-  - For footer: {"type":"FOOTER","text":"..."}
-  - For name: {"name": "snake_case_name"}"""
+OUTPUT (field JSON only, no wrapper):
+- header TEXT: {"type":"HEADER","format":"TEXT","text":"Sweet deals just for you!"}
+- header IMAGE: {"type":"HEADER","format":"IMAGE","example":"media-url"}
+- body: {"type":"BODY","text":"Hi {{1}}, enjoy our special sweets offer!"}
+- buttons: {"type":"BUTTONS","buttons":[{"type":"QUICK_REPLY","text":"Order sweets"},{"type":"QUICK_REPLY","text":"View menu"}]}
+- footer: {"type":"FOOTER","text":"Thank you for choosing us!"}
+- name: {"name": "sweet_shop_offer_jan2024"}"""
 
 
 def _fields_from_draft(draft: Dict[str, Any], cfg: Dict[str, Any]) -> List[FieldDescriptor]:
@@ -247,6 +258,53 @@ def _issues_for(draft: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {"issues": issues, "missing": missing}
 
 
+def _extract_business_context(draft: Dict[str, Any], brand: str, hints: str) -> str:
+    """Extract business context from available information."""
+    context_parts = []
+    
+    # From brand name
+    if brand:
+        brand_lower = brand.lower()
+        if any(word in brand_lower for word in ["sweet", "candy", "dessert", "bakery"]):
+            context_parts.append("sweet/dessert business")
+        elif any(word in brand_lower for word in ["restaurant", "cafe", "food", "kitchen"]):
+            context_parts.append("food/restaurant business")
+        elif any(word in brand_lower for word in ["clinic", "doctor", "medical", "health"]):
+            context_parts.append("healthcare business")
+        elif any(word in brand_lower for word in ["salon", "beauty", "spa", "hair"]):
+            context_parts.append("beauty/wellness business")
+        elif any(word in brand_lower for word in ["shop", "store", "retail", "fashion"]):
+            context_parts.append("retail business")
+        else:
+            context_parts.append(f"business: {brand}")
+    
+    # From existing body content
+    components = draft.get("components", [])
+    for comp in components:
+        if comp.get("type") == "BODY":
+            body_text = (comp.get("text") or "").lower()
+            if "sweet" in body_text or "dessert" in body_text:
+                context_parts.append("sweets/desserts focus")
+            elif "appointment" in body_text:
+                context_parts.append("appointment-based service")
+            elif "order" in body_text:
+                context_parts.append("order-based business")
+            elif "offer" in body_text or "discount" in body_text:
+                context_parts.append("promotional context")
+    
+    # From hints
+    if hints:
+        hints_lower = hints.lower()
+        if "promotion" in hints_lower or "offer" in hints_lower:
+            context_parts.append("promotional message")
+        elif "reminder" in hints_lower:
+            context_parts.append("reminder message")
+        elif "welcome" in hints_lower:
+            context_parts.append("welcome message")
+    
+    return "; ".join(context_parts) if context_parts else "general business"
+
+
 @router.post("/start", response_model=InteractiveStateResponse)
 async def start(req: InteractiveStartRequest, db: AsyncSession = Depends(get_db)):
     """Start interactive template creation with intent analysis."""
@@ -353,28 +411,31 @@ async def upsert_field(req: FieldUpsertRequest, db: AsyncSession = Depends(get_d
 
 @router.post("/field/generate", response_model=InteractiveStateResponse)
 async def generate_field(req: FieldGenerateRequest, db: AsyncSession = Depends(get_db)):
-    """Generate content for a specific field using LLM."""
+    """Generate content for a specific field using LLM with business context."""
     cfg = get_config()
     s = await get_or_create_session(db, req.session_id)
     d = await db.get(Draft, s.active_draft_id)
     
     draft = dict(d.draft or {})
 
-    # Prepare context for LLM
+    # Enhanced context for business-aware generation
+    business_context = _extract_business_context(draft, req.brand, req.hints)
+    
     context = {
         "category": draft.get("category"),
         "language": draft.get("language") or "en_US",
         "brand": req.brand or "",
         "field_id": req.field_id,
         "current_payload": draft,
-        "config": cfg.get("components", {}),
-        "hints": req.hints or ""
+        "config": cfg.get("lint_rules", {}).get("components", {}),
+        "hints": req.hints or "",
+        "business_context": business_context
     }
 
     # Call LLM for field generation
     llm = LlmClient(
         model=cfg.get("model", "gpt-4o-mini"), 
-        temperature=float(cfg.get("temperature", 0.2))
+        temperature=float(cfg.get("temperature", 0.3))  # Slightly higher for creativity
     )
     
     try:
@@ -403,49 +464,3 @@ async def generate_field(req: FieldGenerateRequest, db: AsyncSession = Depends(g
         draft=draft, 
         **errs
     )
-
-
-@router.delete("/field", response_model=InteractiveStateResponse)
-async def delete_field(req: FieldDeleteRequest, db: AsyncSession = Depends(get_db)):
-    """Delete an optional field from the draft."""
-    cfg = get_config()
-    s = await get_or_create_session(db, req.session_id)
-    d = await db.get(Draft, s.active_draft_id)
-    
-    # Apply deletion (value = None)
-    draft = _apply_field(dict(d.draft or {}), req.field_id, None)
-    
-    d.draft = draft
-    await upsert_session(db, s)
-    await db.commit()
-    
-    fields = _fields_from_draft(draft, cfg)
-    errs = _issues_for(draft, cfg)
-    
-    return InteractiveStateResponse(
-        session_id=s.id, 
-        needs_category=not bool(draft.get("category")), 
-        fields=fields, 
-        draft=draft, 
-        **errs
-    )
-
-
-@router.post("/finalize", response_model=FinalizeResponse)
-async def finalize(session_id: str, db: AsyncSession = Depends(get_db)):
-    """Finalize the template after full validation."""
-    cfg = get_config()
-    s = await get_or_create_session(db, session_id)
-    d = await db.get(Draft, s.active_draft_id)
-    
-    draft = dict(d.draft or {})
-
-    # Run full validation
-    schema = cfg.get("creation_payload_schema", {}) or {}
-    issues = validate_schema(draft, schema) + lint_rules(draft, cfg.get("lint_rules", {}) or {})
-    
-    if issues:
-        return FinalizeResponse(ok=False, issues=issues, payload=None)
-
-    # All good - return final payload
-    return FinalizeResponse(ok=True, issues=[], payload=draft)

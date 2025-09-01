@@ -12,8 +12,7 @@ from .db import engine, SessionLocal, Base
 from .models import Draft, User, UserSession
 from .repo import get_or_create_session, upsert_session, create_draft, log_llm, upsert_user_session, touch_user_session
 from .config import get_config, get_cors_origins, is_production
-from .prompts import build_system_prompt, build_context_block
-from .friendly_prompts import build_friendly_system_prompt, get_helpful_examples, get_encouragement_messages
+from .prompts import build_system_prompt, build_context_block, build_friendly_system_prompt
 from .llm import LlmClient
 from .validator import validate_schema, lint_rules
 from .schemas import ChatInput, ChatResponse, SessionData, ChatMessage
@@ -158,7 +157,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def get_db() -> AsyncSession:
+async def get_db():
     async with SessionLocal() as s:
         yield s
 
@@ -362,13 +361,83 @@ def _tokenize(text: str) -> list[str]:
     """Tokenize text for intent matching."""
     return re.findall(r"[A-Za-z0-9_+:/.-]+", (text or "").lower())
 
-def _default_quick_replies(cfg: Dict[str,Any], category: str) -> list[dict]:
-    """Get default quick reply buttons for a category."""
+def _default_quick_replies(cfg: Dict[str,Any], category: str, brand: str = "", business_context: str = "") -> list[dict]:
+    """Get contextually relevant quick reply buttons for a category and business."""
     cat = (category or "").upper()
-    buttons_config = (cfg.get("components") or {}).get("buttons") or {}
-    defaults_by_cat = buttons_config.get("defaults_by_category") or {}
-    labels = defaults_by_cat.get(cat, defaults_by_cat.get("MARKETING", ["Learn more", "Shop now"]))
+    
+    # First, try to get business-specific buttons
+    if brand or business_context:
+        business_type = _detect_business_type(brand, business_context)
+        specific_buttons = _get_business_specific_buttons(business_type, cat)
+        if specific_buttons:
+            return specific_buttons
+    
+    # Fallback to config defaults - fix path to lint_rules.components
+    lint_rules = cfg.get("lint_rules", {})
+    components = lint_rules.get("components", {})
+    buttons_config = components.get("buttons", {})
+    defaults_by_cat = buttons_config.get("defaults_by_category", {})
+    
+    labels = defaults_by_cat.get(cat, defaults_by_cat.get("MARKETING", ["Shop now", "Learn more", "Contact us"]))
     labels = [str(x).strip()[:25] for x in labels if str(x).strip()]
+    return [{"type":"QUICK_REPLY","text":lbl} for lbl in labels[:3]]
+
+def _detect_business_type(brand: str, context: str) -> str:
+    """Detect business type from brand name and context."""
+    text = f"{brand} {context}".lower()
+    
+    # More specific detection patterns
+    if any(word in text for word in ["sweet", "candy", "dessert", "bakery", "cake", "mithai", "confection"]):
+        return "sweets"
+    elif any(word in text for word in ["restaurant", "cafe", "food", "kitchen", "dining", "eatery"]):
+        return "restaurant" 
+    elif any(word in text for word in ["clinic", "doctor", "medical", "health", "hospital", "pharmacy"]):
+        return "healthcare"
+    elif any(word in text for word in ["salon", "beauty", "spa", "hair", "nails", "massage"]):
+        return "beauty"
+    elif any(word in text for word in ["shop", "store", "retail", "fashion", "clothes", "boutique"]):
+        return "retail"
+    elif any(word in text for word in ["service", "repair", "maintenance", "tech", "cleaning"]):
+        return "services"
+    else:
+        return "general"
+
+def _get_business_specific_buttons(business_type: str, category: str) -> list[dict]:
+    """Get business-specific button suggestions."""
+    buttons_map = {
+        "sweets": {
+            "MARKETING": ["Order sweets", "View menu", "Call store"],
+            "UTILITY": ["Track order", "Reorder", "Contact us"],
+        },
+        "restaurant": {
+            "MARKETING": ["Book table", "View menu", "Order now"],
+            "UTILITY": ["Confirm booking", "Modify order", "Call restaurant"],
+        },
+        "healthcare": {
+            "MARKETING": ["Book appointment", "Learn more", "Contact clinic"],
+            "UTILITY": ["Reschedule", "Confirm appointment", "Call clinic"],
+        },
+        "beauty": {
+            "MARKETING": ["Book appointment", "View services", "Special offers"],
+            "UTILITY": ["Reschedule", "Confirm booking", "Contact salon"],
+        },
+        "retail": {
+            "MARKETING": ["Shop now", "View catalog", "Get directions"],
+            "UTILITY": ["Track order", "Return item", "Contact support"],
+        },
+        "services": {
+            "MARKETING": ["Get quote", "Schedule visit", "Learn more"],
+            "UTILITY": ["Reschedule", "Confirm service", "Contact us"],
+        }
+    }
+    
+    cat = category.upper()
+    business_buttons = buttons_map.get(business_type, {})
+    labels = business_buttons.get(cat, [])
+    
+    if not labels:
+        return []
+    
     return [{"type":"QUICK_REPLY","text":lbl} for lbl in labels[:3]]
 
 def _extract_int(text: str) -> int | None:
@@ -563,30 +632,71 @@ def _apply_directives(cfg: Dict[str,Any], directives: list[dict], candidate: Dic
             if kind == "url":
                 url = d.get("url")
                 if url:
-                    buttons.append({"type":"URL","text":"Visit Website","url":url})
-                    msgs.append("Added URL button.")
+                    button_text = "Visit Website"
+                    buttons.append({"type":"URL","text":button_text,"url":url})
+                    msgs.append(f"Added URL button ({button_text}).")
                 else:
                     msgs.append("Couldn't find a URL; added quick replies instead.")
-                    buttons.extend(_default_quick_replies(cfg, cat))
+                    fallback_qrs = _default_quick_replies(cfg, cat)
+                    buttons.extend(fallback_qrs)
+                    if fallback_qrs:
+                        button_labels = [btn.get("text", "") for btn in fallback_qrs[:3]]
+                        labels_str = " / ".join(button_labels)
+                        msgs.append(f"Added {len(fallback_qrs)} quick replies ({labels_str}).")
             elif kind == "phone":
                 phone = d.get("phone")
                 if phone:
-                    buttons.append({"type":"PHONE_NUMBER","text":"Call Us","phone_number":phone})
-                    msgs.append("Added phone button.")
+                    button_text = "Call Us"
+                    buttons.append({"type":"PHONE_NUMBER","text":button_text,"phone_number":phone})
+                    msgs.append(f"Added phone button ({button_text}).")
                 else:
                     msgs.append("Couldn't find a phone number; added quick replies instead.")
-                    buttons.extend(_default_quick_replies(cfg, cat))
+                    fallback_qrs = _default_quick_replies(cfg, cat)
+                    buttons.extend(fallback_qrs)
+                    if fallback_qrs:
+                        button_labels = [btn.get("text", "") for btn in fallback_qrs[:3]]
+                        labels_str = " / ".join(button_labels)
+                        msgs.append(f"Added {len(fallback_qrs)} quick replies ({labels_str}).")
             else:
-                qrs = _default_quick_replies(cfg, cat)
+                # Get business context for smart button generation
+                brand = memory.get("brand_name", "")
+                business_context = memory.get("business_context", "")
+                qrs = _default_quick_replies(cfg, cat, brand, business_context)
                 if count and count < len(qrs): qrs = qrs[:count]
                 if qrs:
                     buttons.extend(qrs)
-                    msgs.append(f"Added {len(qrs)} quick replies.")
+                    # Create confirmation with actual button labels (up to 3) from all buttons in this component
+                    all_button_labels = [btn.get("text", "") for btn in buttons[:3]]
+                    if len(all_button_labels) <= 3:
+                        labels_str = " / ".join(all_button_labels)
+                        msgs.append(f"Added {len(buttons)} quick replies ({labels_str}).")
+                    else:
+                        labels_str = " / ".join(all_button_labels[:3])
+                        msgs.append(f"Added {len(buttons)} quick replies ({labels_str} + {len(buttons)-3} more).")
                 else:
                     # Fallback if no defaults configured
                     fallback_buttons = [{"type":"QUICK_REPLY","text":"Learn More"}, {"type":"QUICK_REPLY","text":"Contact Us"}]
                     buttons.extend(fallback_buttons)
-                    msgs.append(f"Added {len(fallback_buttons)} quick replies.")
+                    # Create confirmation with actual fallback button labels from all buttons
+                    all_button_labels = [btn.get("text", "") for btn in buttons[:3]]
+                    labels_str = " / ".join(all_button_labels)
+                    msgs.append(f"Added {len(buttons)} quick replies ({labels_str}).")
+            
+            # Deduplicate buttons after adding them
+            if buttons:
+                seen_texts = set()
+                deduplicated_buttons = []
+                for btn in buttons:
+                    btn_text = btn.get("text", "")
+                    if btn_text and btn_text not in seen_texts:
+                        deduplicated_buttons.append(btn)
+                        seen_texts.add(btn_text)
+                
+                # Update the component with deduplicated buttons
+                btn_block = _ensure_buttons()
+                if btn_block:
+                    btn_block["buttons"] = deduplicated_buttons
+            
             out["components"] = comps
 
         # 2) set_brand
@@ -1022,18 +1132,41 @@ def _auto_apply_extras_on_yes(user_text: str, candidate: Dict[str, Any], memory:
             comps.append({"type":"FOOTER","text":"Thank you!"})
             changed = True
         if memory.get("wants_buttons") and not has("BUTTONS"):
-            # Use configuration-driven defaults instead of hardcoded labels
+            # Use configuration-driven defaults with business context
             from .config import get_config
             cfg = get_config() or {}
-            defaults = (cfg.get("components", {})
-                          .get("buttons", {})
-                          .get("defaults_by_category", {})
-                          .get(cat, ["Learn more", "Shop now"]))
-            comps.append({
-                "type":"BUTTONS",
-                "buttons":[{"type":"QUICK_REPLY","text":t} for t in defaults[:2]]
-            })
-            changed = True
+            brand = memory.get("brand_name", "")
+            business_context = memory.get("business_type", "")
+            buttons = _default_quick_replies(cfg, cat, brand, business_context)
+            if buttons:
+                comps.append({
+                    "type":"BUTTONS",
+                    "buttons": buttons
+                })
+                changed = True
+        elif memory.get("wants_buttons") and has("BUTTONS"):
+            # Handle adding more buttons - avoid duplicates
+            existing_comp = next((c for c in comps if c.get("type") == "BUTTONS"), None)
+            if existing_comp:
+                existing_buttons = existing_comp.get("buttons", [])
+                existing_texts = [b.get("text", "") for b in existing_buttons]
+                
+                # Generate new buttons but filter out duplicates
+                from .config import get_config
+                cfg = get_config() or {}
+                brand = memory.get("brand_name", "")
+                business_context = memory.get("business_type", "")
+                new_buttons = _default_quick_replies(cfg, cat, brand, business_context)
+                
+                for btn in new_buttons:
+                    if btn.get("text") not in existing_texts:
+                        existing_buttons.append(btn)
+                        existing_texts.append(btn.get("text"))
+                        if len(existing_buttons) >= 3:  # Max 3 buttons
+                            break
+                
+                existing_comp["buttons"] = existing_buttons
+                changed = True
     
     if changed:
         cand["components"] = comps
@@ -1137,6 +1270,45 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         memory["wants_footer"] = True
     if "button" in lower_msg or "buttons" in lower_msg:
         memory["wants_buttons"] = True
+    
+    # Auto-detect category from promotional intent
+    if not memory.get("category") and not draft.get("category"):
+        promo_keywords = ["promotional", "promotion", "offer", "discount", "sale", "special", "deal"]
+        if any(keyword in safe_message.lower() for keyword in promo_keywords):
+            memory["category"] = "MARKETING"
+            draft["category"] = "MARKETING"
+    
+    # Auto-detect category from authentication intent
+    if not memory.get("category") and not draft.get("category"):
+        auth_keywords = ["login", "password", "code", "verification", "otp", "security", "verify", "authenticate", "pin", "token"]
+        if any(keyword in safe_message.lower() for keyword in auth_keywords):
+            memory["category"] = "AUTHENTICATION"
+            draft["category"] = "AUTHENTICATION"
+    
+    # Extract business context more broadly
+    if not memory.get("business_type"):
+        business_type = _detect_business_type(safe_message, memory.get("brand_name", ""))
+        if business_type != "general":
+            memory["business_type"] = business_type
+    
+    # Extract brand name if mentioned - improved pattern
+    if not memory.get("brand_name"):
+        brand_patterns = [
+            r'(?:shop|store|business|company|clinic|salon)\s+(?:called|named)\s+([A-Z][A-Za-z\s]+)',
+            r'(?:called|named)\s+([A-Z][A-Za-z\s]+)(?:\s+(?:shop|store|business|company))?',
+            r'my\s+(?:shop|store|business|company)\s+([A-Z][A-Za-z\s]+)',
+            r'([A-Z][A-Za-z\s]+)\s+(?:shop|store|business|company)',
+            r'at\s+([A-Z][A-Za-z\s]+)(?:\s+(?:shop|store))?'
+        ]
+        
+        for pattern in brand_patterns:
+            match = re.search(pattern, safe_message)
+            if match:
+                potential_brand = match.group(1).strip()
+                if len(potential_brand) > 2 and potential_brand not in ['Sweet', 'Shop', 'Store']:
+                    memory["brand_name"] = potential_brand
+                    break
+
     s.memory = memory
 
     current_state = _determine_conversation_state(draft, memory)
@@ -1153,9 +1325,25 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
     if explicit_content:
         memory["user_provided_content"] = explicit_content
         memory["content_extraction_hint"] = f"User provided: {explicit_content[:50]}..."
+        
+        # Directly inject content into draft if we found it
+        components = draft.get("components", [])
+        body_comp = next((c for c in components if c.get("type") == "BODY"), None)
+        if not body_comp or not body_comp.get("text", "").strip():
+            # Create or update body component
+            if body_comp:
+                body_comp["text"] = explicit_content
+            else:
+                components.append({"type": "BODY", "text": explicit_content})
+            draft["components"] = components
+            d.draft = draft
     
     s.memory = memory
 
+    # Inject business context into LLM memory for better button generation
+    if memory.get("business_type") and memory.get("business_type") != "general":
+        memory["llm_context_hint"] = f"Business: {memory.get('business_type', 'general')} {memory.get('brand_name', '')}"
+    
     # Auto-name session if this is the first message and user_id is provided
     if inp.user_id and len(msgs) == 0:
         from sqlalchemy import select
@@ -1258,6 +1446,20 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
                 # refresh memory if brand pending was set
                 s.memory = memory
 
+        # Apply AUTHENTICATION category constraints - remove buttons if category is AUTH
+        cat = (merged.get("category") or memory.get("category") or "").upper()
+        if cat == "AUTHENTICATION":
+            components = merged.get("components", [])
+            original_length = len(components)
+            filtered_components = [comp for comp in components if not (isinstance(comp, dict) and (comp.get("type") or "").upper() == "BUTTONS")]
+            if len(filtered_components) < original_length:
+                merged["components"] = filtered_components
+                d.draft = merged
+                # Clear any button-related memory flags
+                memory.pop("wants_buttons", None)
+                s.memory = memory
+                msgs_applied = (msgs_applied or []) + ["Removed buttons (not allowed for Authentication templates)."]
+
         # If brand was pending and BODY appeared via LLM later, inject it automatically
         if memory.get("brand_name_pending"):
             has_body = any((c.get("type") or "").upper()=="BODY" for c in (merged.get("components") or []))
@@ -1294,7 +1496,14 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         final_reply = (reply or _targeted_missing_reply(missing, memory)).strip()
 
         # If we applied deterministic edits and the LLM reply is generic, override with a helpful confirmation
-        if (msgs_applied) and (not reply or reply.strip().lower().startswith("please tell me more")):
+        if (msgs_applied) and (not reply or reply.strip().lower().startswith("please tell me more") or 
+                              "what quick reply buttons" in reply.lower() or "what specific buttons" in reply.lower() or
+                              "what buttons would you like" in reply.lower()):
+            final_reply = "; ".join(msgs_applied) + " Anything else to add?"
+        
+        # Special handling for button confirmations - prioritize our detailed confirmations
+        elif (msgs_applied and any("quick replies" in msg for msg in msgs_applied) and 
+              _has_component(merged, "BUTTONS")):
             final_reply = "; ".join(msgs_applied) + " Anything else to add?"
 
         # Add encouragement and examples from friendly_prompts when appropriate
@@ -1313,9 +1522,9 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
                     example = random.choice(category_examples)
                     final_reply += f"\n\nHere's an example: {example}"
 
-        if _has_component(merged, "BUTTONS") and "button" in (final_reply.lower()):
-            # Replace the stale question with a confirmation
-            final_reply = "Added two quick replies (View offers / Order now). Anything else to add?"
+        if _has_component(merged, "BUTTONS") and "button" in (final_reply.lower()) and not msgs_applied:
+            # Only use fallback if we don't have specific confirmation messages
+            final_reply = "Added quick reply buttons. Anything else to add?"
         if extras_present["header"] and "header" in final_reply.lower():
             final_reply = "Added a short TEXT header. Anything else to add?"
         if extras_present["footer"] and "footer" in final_reply.lower():
@@ -1331,9 +1540,10 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         def _has_component_kind(p: Dict[str, Any], kind: str) -> bool:
             return any(isinstance(c, dict) and (c.get("type") or "").upper() == kind for c in (p.get("components") or []))
 
-        # Pre-FINAL guard: For AUTHENTICATION category, reject non-TEXT headers
+        # Pre-FINAL guard: For AUTHENTICATION category, reject non-TEXT headers and remove buttons
         cat = (candidate.get("category") or memory.get("category") or "").upper()
         if cat == "AUTHENTICATION":
+            # Check for non-TEXT headers
             for comp in (candidate.get("components") or []):
                 if isinstance(comp, dict) and (comp.get("type") or "").upper() == "HEADER":
                     header_format = (comp.get("format") or "").upper()
@@ -1347,6 +1557,15 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
                         return ChatResponse(session_id=s.id, reply=error_msg, draft=d.draft,
                                             missing=_compute_missing(d.draft, memory),
                                             final_creation_payload=None)
+            
+            # Remove any buttons - AUTHENTICATION templates cannot have interactive elements
+            components = candidate.get("components", [])
+            filtered_components = [comp for comp in components if not (isinstance(comp, dict) and (comp.get("type") or "").upper() == "BUTTONS")]
+            if len(filtered_components) < len(components):
+                candidate["components"] = filtered_components
+                # Clear any button-related memory flags
+                memory.pop("wants_buttons", None)
+                s.memory = memory
 
         # enforce requested extras before validate (only for non-AUTH categories)
         missing_extras = []
@@ -1398,7 +1617,7 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         await touch_user_session(db, inp.user_id, s.id)
         await upsert_session(db, s); await db.commit()
         return ChatResponse(session_id=s.id, reply=reply or "Finalized.", draft=d.draft,
-                            missing=None, final_creation_payload=candidate_for_validation)
+                            missing=[], final_creation_payload=candidate_for_validation)
 
     # 8) Fallback (treat as ASK)
     final_draft = candidate or draft
@@ -1480,6 +1699,7 @@ def _get_business_examples_for_category(category: str) -> list:
             "📦 E-commerce order confirmations",
             "🏥 Medical appointment reminders",
             "🚗 Service center status updates", 
+            
             "💳 Payment confirmation messages"
         ],
         "AUTHENTICATION": [
@@ -1549,46 +1769,93 @@ def _provide_content_suggestions(category: str, business_type: str = "", user_go
     
     return suggestions
 
-def _get_journey_stage_from_memory(memory: dict) -> str:
-    """Determine what stage of the journey the user is in."""
-    if not memory.get("category") and not memory.get("business_type"):
+def _extract_explicit_content(message: str) -> str:
+    """Extract explicit content from user message."""
+    patterns = [
+        # Direct content patterns
+        r"(?:message should say|text should be|content is|message is|should say|wants to say):\s*[\"']?(.+?)[\"']?(?:\s*$|\.|!|\?)",
+        r"(?:create a message|template).*?(?:saying|that says|with text):\s*[\"']?(.+?)[\"']?(?:\s*$|\.|!|\?)",
+        r"(?:send|create).*?[\"'](.{15,})[\"']",  # Quoted content (min 15 chars)
+        
+        # Promotional content patterns
+        r"(?:special|offer|discount|promotion|sale).*?[\"']?([^\"']{20,})[\"']?(?:\s*$|\.|!|\?)",
+        r"(?:get|enjoy|grab|buy).*?(\d+%?\s*off.*?)(?:\.|!|$)",
+        
+        # Message-like patterns
+        r"^[\"']?([A-Z][^\"']{20,})[\"']?[.!]?\s*$",  # Standalone sentences starting with capital
+        r"(?:message|text).*?[\"']([^\"']{15,})[\"']",
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, message, re.IGNORECASE | re.DOTALL)
+        if match:
+            content = match.group(1).strip()
+            # Clean up common artifacts
+            content = re.sub(r'\s+', ' ', content)  # Normalize whitespace
+            content = content.strip('.,;:!?')  # Remove trailing punctuation
+            
+            if len(content) >= 10 and not content.lower().startswith(('http', 'www')):
+                return content
+    
+    return ""
+
+def _get_journey_stage_from_memory(memory: Dict[str, Any]) -> str:
+    """Determine conversation journey stage from memory."""
+    if not memory.get("category"):
         return "welcome"
-    elif memory.get("business_type") and not memory.get("category"):
-        return "choose_type"
-    elif memory.get("category") and not memory.get("proposed_content"):
-        return "create_content"
-    elif memory.get("proposed_content") and not memory.get("extras_offered"):
+    elif not memory.get("business_type") and not memory.get("brand_name"):
+        return "business_context"
+    elif not any(memory.get(k) for k in ["body", "content"]):
+        return "content_creation"
+    elif memory.get("wants_buttons") or memory.get("wants_header") or memory.get("wants_footer"):
         return "add_extras"
     else:
         return "review"
 
-def _extract_explicit_content(message: str) -> str:
-    """Extract explicit content when user provides it directly."""
-    msg = message.strip()
-    
-    # Common patterns users use to provide content
-    patterns = [
-        r"the message should say:?\s*(.+)",
-        r"the message is:?\s*(.+)", 
-        r"message content:?\s*(.+)",
-        r"the text should be:?\s*(.+)",
-        r"here'?s the message:?\s*(.+)",
-        r"use this message:?\s*(.+)",
-        r"send this:?\s*(.+)",
-        r"say:?\s*(.+)",
+def get_encouragement_messages() -> List[str]:
+    """Get encouraging messages for user feedback."""
+    return [
+        "Great progress!",
+        "Looking good!",
+        "Perfect!",
+        "Excellent!",
+        "Well done!",
+        "Nice work!",
+        "Fantastic!"
     ]
-    
-    import re
-    for pattern in patterns:
-        match = re.search(pattern, msg, re.IGNORECASE | re.DOTALL)
-        if match:
-            content = match.group(1).strip()
-            # Remove quotes if present
-            if (content.startswith('"') and content.endswith('"')) or \
-               (content.startswith("'") and content.endswith("'")):
-                content = content[1:-1]
-            return content
-    
-    return ""
+
+def get_helpful_examples() -> Dict[str, List[str]]:
+    """Get helpful examples by category."""
+    return {
+        "marketing_examples": [
+            "🎉 Hi {{1}}! Special 20% off on all sweets this Diwali. Use code SWEET20. Valid till Oct 31st.",
+            "🛍️ Hello {{1}}! New winter collection is here. Get free shipping on orders above ₹999.",
+            "☕ Hi {{1}}! Buy 2 coffees, get 1 free! Valid today only at {{2}} cafe."
+        ],
+        "utility_examples": [
+            "Hi {{1}}, your order #{{2}} has been confirmed. Expected delivery: {{3}}. Track: {{4}}",
+            "Hello {{1}}, your appointment at {{2}} clinic is confirmed for {{3}} at {{4}}.",
+            "Hi {{1}}, your {{2}} subscription will renew on {{3}}. Amount: ₹{{4}}."
+        ],
+        "authentication_examples": [
+            "{{1}} is your verification code. Valid for {{2}} minutes. Don't share this code.",
+            "Your login code is {{1}}. Use this to access your account. Expires in {{2}} minutes."
+        ]
+    }
+
+def scrub_sensitive_data(text: str) -> str:
+    """Remove sensitive data from text for logging."""
+    # Simple scrubbing - could be enhanced
+    return re.sub(r'\b\d{4,}\b', '[NUMBER]', text)
+
+def _redact_secrets(data: Any) -> Any:
+    """Redact secrets from data for logging."""
+    if isinstance(data, dict):
+        return {k: _redact_secrets(v) for k, v in data.items() 
+                if k not in ['password', 'token', 'key', 'secret']}
+    elif isinstance(data, list):
+        return [_redact_secrets(item) for item in data]
+    else:
+        return data
 
 

@@ -179,6 +179,11 @@ def lint_rules(payload: Dict[str, Any], rules: Dict[str, Any]) -> List[str]:
         if isinstance(c, dict) and c.get("type") == "FOOTER":
             if c.get("text") and len(c["text"]) > 60:
                 issues.append("FOOTER exceeds 60 chars")
+            # FOOTER must not contain placeholders
+            if c.get("text"):
+                phs = _placeholders_in(c["text"])
+                if phs:
+                    issues.append("FOOTER must not contain placeholders")
 
     # ---- Auth restrictions ----
     if cat == "AUTHENTICATION":

@@ -174,8 +174,8 @@ lint_rules:
   components:
     buttons:
       defaults_by_category:
-        MARKETING: ["Learn more", "Shop now"]
-        UTILITY: ["View status", "Help"]
+        MARKETING: ["Shop now", "Learn more", "Contact us"]
+        UTILITY: ["View details", "Update info", "Get help"]
         AUTHENTICATION: []  # buttons not allowed anyway
     text:
       shorten:
