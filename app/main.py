@@ -518,6 +518,8 @@ def _get_business_specific_buttons(business_type: str, category: str) -> list[di
     if not labels:
         return []
     
+    # Meta UI cap for button titles is effectively ~20 chars. Trim here.
+    labels = [str(x).strip()[:20] for x in labels if str(x).strip()]
     return [{"type":"QUICK_REPLY","text":lbl} for lbl in labels[:3]]
 
 def _extract_int(text: str) -> int | None:
@@ -718,7 +720,12 @@ def _apply_directives(cfg: Dict[str,Any], directives: list[dict], candidate: Dic
                 else:
                     msgs.append("Couldn't find a URL; added quick replies instead.")
                     fallback_qrs = _default_quick_replies(cfg, cat)
-                    buttons.extend(fallback_qrs)
+                    # Don't exceed 3 when adding fallback buttons
+                    existing = len(buttons)
+                    space = max(0, 3 - existing)
+                    fallback_qrs = fallback_qrs[:space] if space else []
+                    if fallback_qrs:
+                        buttons.extend(fallback_qrs)
                     if fallback_qrs:
                         button_labels = [btn.get("text", "") for btn in fallback_qrs[:3]]
                         labels_str = " / ".join(button_labels)
@@ -733,7 +740,12 @@ def _apply_directives(cfg: Dict[str,Any], directives: list[dict], candidate: Dic
                 else:
                     msgs.append("Couldn't find a phone number; added quick replies instead.")
                     fallback_qrs = _default_quick_replies(cfg, cat)
-                    buttons.extend(fallback_qrs)
+                    # Don't exceed 3 when adding fallback buttons  
+                    existing = len(buttons)
+                    space = max(0, 3 - existing)
+                    fallback_qrs = fallback_qrs[:space] if space else []
+                    if fallback_qrs:
+                        buttons.extend(fallback_qrs)
                     if fallback_qrs:
                         button_labels = [btn.get("text", "") for btn in fallback_qrs[:3]]
                         labels_str = " / ".join(button_labels)
@@ -745,7 +757,12 @@ def _apply_directives(cfg: Dict[str,Any], directives: list[dict], candidate: Dic
                 qrs = _default_quick_replies(cfg, cat, brand, business_context)
                 if count and count < len(qrs): qrs = qrs[:count]
                 if qrs:
-                    buttons.extend(qrs)
+                    # Don't exceed 3 when adding contextual quick replies
+                    existing = len(buttons)
+                    space = max(0, 3 - existing)
+                    qrs = qrs[:space] if space else []
+                    if qrs:
+                        buttons.extend(qrs)
                     # Create confirmation with actual button labels (up to 3) from all buttons in this component
                     all_button_labels = [btn.get("text", "") for btn in buttons[:3]]
                     if len(all_button_labels) <= 3:
@@ -757,7 +774,12 @@ def _apply_directives(cfg: Dict[str,Any], directives: list[dict], candidate: Dic
                 else:
                     # Fallback if no defaults configured
                     fallback_buttons = [{"type":"QUICK_REPLY","text":"Learn More"}, {"type":"QUICK_REPLY","text":"Contact Us"}]
-                    buttons.extend(fallback_buttons)
+                    # Don't exceed 3 when adding fallback buttons
+                    existing = len(buttons)
+                    space = max(0, 3 - existing)
+                    fallback_buttons = fallback_buttons[:space] if space else []
+                    if fallback_buttons:
+                        buttons.extend(fallback_buttons)
                     # Create confirmation with actual fallback button labels from all buttons
                     all_button_labels = [btn.get("text", "") for btn in buttons[:3]]
                     labels_str = " / ".join(all_button_labels)
@@ -973,8 +995,9 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
                             btn["phone_number"] = _normalize_phone(phone)
                             
                         b2.append(btn)
+                    # Enforce WhatsApp limit at sanitize time too
                     if b2:
-                        clean.append({"type":"BUTTONS","buttons": b2})
+                        clean.append({"type":"BUTTONS","buttons": b2[:3]})
                 elif comp.get("text") or comp.get("label") or comp.get("title"):
                     # Malformed format: Individual BUTTONS component with text/label/title
                     # Collect these to convert to proper format
@@ -990,7 +1013,7 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
         
         # Convert collected individual buttons to proper BUTTONS component
         if collected_buttons:
-            clean.append({"type": "BUTTONS", "buttons": collected_buttons})
+            clean.append({"type": "BUTTONS", "buttons": collected_buttons[:3]})
                         
         if clean:
             c["components"] = clean
@@ -1096,7 +1119,7 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
             
             # Add BUTTONS component
             if normalized_buttons:
-                components.append({"type": "BUTTONS", "buttons": normalized_buttons})
+                components.append({"type": "BUTTONS", "buttons": normalized_buttons[:3]})
                 c["components"] = components
     
     # Apply AUTH category constraints and button normalization
@@ -1231,7 +1254,6 @@ def _auto_apply_extras_on_yes(user_text: str, candidate: Dict[str, Any], memory:
             changed = True
         if memory.get("wants_buttons") and not has("BUTTONS"):
             # Use configuration-driven defaults with business context
-            from .config import get_config
             cfg = get_config() or {}
             brand = memory.get("brand_name", "")
             business_context = memory.get("business_type", "")
@@ -1250,7 +1272,6 @@ def _auto_apply_extras_on_yes(user_text: str, candidate: Dict[str, Any], memory:
                 existing_buttons = existing_comp.get("buttons", [])
                 
                 # Generate new buttons and merge
-                from .config import get_config
                 cfg = get_config() or {}
                 brand = memory.get("brand_name", "")
                 business_context = memory.get("business_type", "")
