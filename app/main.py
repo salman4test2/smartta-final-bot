@@ -166,15 +166,15 @@ async def _auto_name_session_if_needed(db: AsyncSession, user_id: str, session_i
 MAX_BUTTONS = 3
 
 def _cap_buttons(buttons: list[dict]) -> list[dict]:
-    """Deduplicate buttons by text (case-insensitive) and cap at MAX_BUTTONS."""
+    """Deduplicate buttons by text (case-insensitive), enforce 20-char limit, and cap at MAX_BUTTONS."""
     seen = set()
     out = []
     for b in buttons:
         if not isinstance(b, dict):
             continue
         
-        # Create key for deduplication
-        btn_text = (b.get("text") or "").strip()
+        # Create key for deduplication and enforce text length limit
+        btn_text = (b.get("text") or "").strip()[:20]
         btn_type = (b.get("type") or "QUICK_REPLY").upper()
         key = (btn_type, btn_text.lower())
         
@@ -182,7 +182,10 @@ def _cap_buttons(buttons: list[dict]) -> list[dict]:
             continue
             
         seen.add(key)
-        out.append(b)
+        # Create a copy with enforced text length
+        btn_copy = dict(b)
+        btn_copy["text"] = btn_text
+        out.append(btn_copy)
         
         if len(out) >= MAX_BUTTONS:
             break
@@ -237,7 +240,7 @@ LANG_MAP = {
 }
 
 AFFIRM_REGEX = re.compile(
-    r'^\s*(yes|y|ok|okay|sure|sounds\s+good|go\s+ahead|please\s+proceed|proceed|confirm|finalize|do\s+it)\b',
+    r'^\s*(yes|y|ok|okay|sure|sounds\s+good|go\s+ahead|please\s+proceed|proceed|confirm|finalize|do\s+it|yeah|yep|yup|go\s+for\s+it|let\'s\s+do\s+it|absolutely|alright|looks\s+good)\b',
     re.I
 )
 
@@ -460,7 +463,7 @@ def _default_quick_replies(cfg: Dict[str,Any], category: str, brand: str = "", b
     
     labels = defaults_by_cat.get(cat, defaults_by_cat.get("MARKETING", ["Shop now", "Learn more", "Contact us"]))
     labels = [str(x).strip()[:20] for x in labels if str(x).strip()]
-    return [{"type":"QUICK_REPLY","text":lbl} for lbl in labels[:3]]
+    return [{"type":"QUICK_REPLY","text":lbl} for lbl in labels[:MAX_BUTTONS]]
 
 def _detect_business_type(brand: str, context: str) -> str:
     """Detect business type from brand name and context."""
@@ -520,7 +523,7 @@ def _get_business_specific_buttons(business_type: str, category: str) -> list[di
     
     # Meta UI cap for button titles is effectively ~20 chars. Trim here.
     labels = [str(x).strip()[:20] for x in labels if str(x).strip()]
-    return [{"type":"QUICK_REPLY","text":lbl} for lbl in labels[:3]]
+    return [{"type":"QUICK_REPLY","text":lbl} for lbl in labels[:MAX_BUTTONS]]
 
 def _extract_int(text: str) -> int | None:
     """Extract integer from text for length targets, counts, etc."""
@@ -720,14 +723,14 @@ def _apply_directives(cfg: Dict[str,Any], directives: list[dict], candidate: Dic
                 else:
                     msgs.append("Couldn't find a URL; added quick replies instead.")
                     fallback_qrs = _default_quick_replies(cfg, cat)
-                    # Don't exceed 3 when adding fallback buttons
+                    # Don't exceed MAX_BUTTONS when adding fallback buttons
                     existing = len(buttons)
-                    space = max(0, 3 - existing)
+                    space = max(0, MAX_BUTTONS - existing)
                     fallback_qrs = fallback_qrs[:space] if space else []
                     if fallback_qrs:
                         buttons.extend(fallback_qrs)
                     if fallback_qrs:
-                        button_labels = [btn.get("text", "") for btn in fallback_qrs[:3]]
+                        button_labels = [btn.get("text", "") for btn in fallback_qrs[:MAX_BUTTONS]]
                         labels_str = " / ".join(button_labels)
                         msgs.append(f"Added {len(fallback_qrs)} quick replies ({labels_str}).")
             elif kind == "phone":
@@ -740,14 +743,14 @@ def _apply_directives(cfg: Dict[str,Any], directives: list[dict], candidate: Dic
                 else:
                     msgs.append("Couldn't find a phone number; added quick replies instead.")
                     fallback_qrs = _default_quick_replies(cfg, cat)
-                    # Don't exceed 3 when adding fallback buttons  
+                    # Don't exceed MAX_BUTTONS when adding fallback buttons  
                     existing = len(buttons)
-                    space = max(0, 3 - existing)
+                    space = max(0, MAX_BUTTONS - existing)
                     fallback_qrs = fallback_qrs[:space] if space else []
                     if fallback_qrs:
                         buttons.extend(fallback_qrs)
                     if fallback_qrs:
-                        button_labels = [btn.get("text", "") for btn in fallback_qrs[:3]]
+                        button_labels = [btn.get("text", "") for btn in fallback_qrs[:MAX_BUTTONS]]
                         labels_str = " / ".join(button_labels)
                         msgs.append(f"Added {len(fallback_qrs)} quick replies ({labels_str}).")
             else:
@@ -757,31 +760,34 @@ def _apply_directives(cfg: Dict[str,Any], directives: list[dict], candidate: Dic
                 qrs = _default_quick_replies(cfg, cat, brand, business_context)
                 if count and count < len(qrs): qrs = qrs[:count]
                 if qrs:
-                    # Don't exceed 3 when adding contextual quick replies
+                    # Don't exceed MAX_BUTTONS when adding contextual quick replies
                     existing = len(buttons)
-                    space = max(0, 3 - existing)
+                    space = max(0, MAX_BUTTONS - existing)
                     qrs = qrs[:space] if space else []
                     if qrs:
+                        # Enforce button text length limit before adding
+                        for q in qrs:
+                            q["text"] = str(q.get("text","")).strip()[:20]
                         buttons.extend(qrs)
-                    # Create confirmation with actual button labels (up to 3) from all buttons in this component
-                    all_button_labels = [btn.get("text", "") for btn in buttons[:3]]
-                    if len(all_button_labels) <= 3:
+                    # Create confirmation with actual button labels (up to MAX_BUTTONS) from all buttons in this component
+                    all_button_labels = [btn.get("text", "") for btn in buttons[:MAX_BUTTONS]]
+                    if len(all_button_labels) <= MAX_BUTTONS:
                         labels_str = " / ".join(all_button_labels)
                         msgs.append(f"Added {len(buttons)} quick replies ({labels_str}).")
                     else:
-                        labels_str = " / ".join(all_button_labels[:3])
-                        msgs.append(f"Added {len(buttons)} quick replies ({labels_str} + {len(buttons)-3} more).")
+                        labels_str = " / ".join(all_button_labels[:MAX_BUTTONS])
+                        msgs.append(f"Added {len(buttons)} quick replies ({labels_str} + {len(buttons)-MAX_BUTTONS} more).")
                 else:
                     # Fallback if no defaults configured
                     fallback_buttons = [{"type":"QUICK_REPLY","text":"Learn More"}, {"type":"QUICK_REPLY","text":"Contact Us"}]
-                    # Don't exceed 3 when adding fallback buttons
+                    # Don't exceed MAX_BUTTONS when adding fallback buttons
                     existing = len(buttons)
-                    space = max(0, 3 - existing)
+                    space = max(0, MAX_BUTTONS - existing)
                     fallback_buttons = fallback_buttons[:space] if space else []
                     if fallback_buttons:
                         buttons.extend(fallback_buttons)
                     # Create confirmation with actual fallback button labels from all buttons
-                    all_button_labels = [btn.get("text", "") for btn in buttons[:3]]
+                    all_button_labels = [btn.get("text", "") for btn in buttons[:MAX_BUTTONS]]
                     labels_str = " / ".join(all_button_labels)
                     msgs.append(f"Added {len(buttons)} quick replies ({labels_str}).")
             
@@ -974,8 +980,8 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
                         elif btn_type.upper() not in ("QUICK_REPLY", "URL", "PHONE_NUMBER"):
                             btn_type = "QUICK_REPLY"  # Default fallback
                             
-                        # Normalize button structure
-                        btn = {"type": btn_type, "text": btn_text}
+                        # Normalize button structure + enforce label length
+                        btn = {"type": btn_type, "text": str(btn_text).strip()[:20]}
                         
                         # Preserve payload for quick replies
                         payload = b.get("payload")
@@ -997,7 +1003,7 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
                         b2.append(btn)
                     # Enforce WhatsApp limit at sanitize time too
                     if b2:
-                        clean.append({"type":"BUTTONS","buttons": b2[:3]})
+                        clean.append({"type":"BUTTONS","buttons": b2[:MAX_BUTTONS]})
                 elif comp.get("text") or comp.get("label") or comp.get("title"):
                     # Malformed format: Individual BUTTONS component with text/label/title
                     # Collect these to convert to proper format
@@ -1013,7 +1019,7 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
         
         # Convert collected individual buttons to proper BUTTONS component
         if collected_buttons:
-            clean.append({"type": "BUTTONS", "buttons": collected_buttons[:3]})
+            clean.append({"type": "BUTTONS", "buttons": collected_buttons[:MAX_BUTTONS]})
                         
         if clean:
             c["components"] = clean
@@ -1119,7 +1125,11 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
             
             # Add BUTTONS component
             if normalized_buttons:
-                components.append({"type": "BUTTONS", "buttons": normalized_buttons[:3]})
+                # Enforce label length + max count at conversion point too
+                for nb in normalized_buttons:
+                    if "text" in nb:
+                        nb["text"] = str(nb["text"]).strip()[:20]
+                components.append({"type": "BUTTONS", "buttons": normalized_buttons[:MAX_BUTTONS]})
                 c["components"] = components
     
     # Apply AUTH category constraints and button normalization
@@ -1334,7 +1344,10 @@ def _targeted_missing_reply(missing: List[str], memory: Dict[str, Any] = None) -
     if "header" in missing:
         return "You asked for a header. Should I add a short TEXT header like 'Festive offer just for you!'?"
     if "buttons" in missing:
-        return "You asked for buttons. Should I add two quick replies like 'View offers' and 'Order now'?"
+        # Generate dynamic examples based on context
+        example_labels = ["View offers", "Order now", "Learn more", "Call us", "Visit store", "Get quote"]
+        selected = example_labels[:2]  # Take first 2
+        return f"You asked for buttons. Should I add two quick replies like '{selected[0]}' and '{selected[1]}'?"
     if "footer" in missing:
         return "You asked for a footer. Should I add a short footer like 'Thank you!'?"
     return "What would you like me to add next?"
@@ -1713,7 +1726,7 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
             btn_comp = next((c for c in (merged.get("components") or []) if (c.get("type") or "").upper() == "BUTTONS"), None)
             if btn_comp:
                 labels = [b.get("text","").strip() for b in (btn_comp.get("buttons") or []) if b.get("text")]
-                shown = ", ".join(labels[:3]) if labels else "your quick replies"
+                shown = ", ".join(labels[:MAX_BUTTONS]) if labels else "your quick replies"
                 final_reply = f"Added quick replies ({shown}). Anything else to add?"
             else:
                 final_reply = "Added quick reply buttons. Anything else to add?"
