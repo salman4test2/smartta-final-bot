@@ -616,7 +616,14 @@ def _parse_user_directives(cfg: Dict[str,Any], text: str) -> list[dict]:
         re.search(r"\bcall\s+us\b", text_lower)  # "call us" patterns
     )
     
-    if button_indicators:
+    # Detect button modification (replace/change button text)
+    button_modify_indicators = any(phrase in text_lower for phrase in [
+        "modify the button", "change the button", "replace button", "update button",
+        "modify button", "change button", "button should be", "make the button",
+        "i need only one button", "only one button", "just one button", "one button"
+    ])
+    
+    if button_indicators or button_modify_indicators:
         url = URL_RE.search(text)
         phone = PHONE_RE.search(text)
         
@@ -644,8 +651,36 @@ def _parse_user_directives(cfg: Dict[str,Any], text: str) -> list[dict]:
             else:
                 phone_num = phone.group(0)
         
+        # Extract specific button text if provided
+        button_text = None
+        if button_modify_indicators or any(phrase in text_lower for phrase in ["button to", "button as", "button with"]):
+            # Look for specific button text patterns
+            patterns = [
+                r"button (?:to|as|with|should be|text)\s+[\"']?([^\"'\n]+)[\"']?",
+                r"modify.*button.*to\s+[\"']?([^\"'\n]+)[\"']?",
+                r"change.*button.*to\s+[\"']?([^\"'\n]+)[\"']?",
+                r"only.*button\s+[\"']?([^\"'\n]+)[\"']?",
+                r"just.*button\s+[\"']?([^\"'\n]+)[\"']?",
+                r"one button\s+[\"']?([^\"'\n]+)[\"']?",
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, text, re.I)
+                if match:
+                    button_text = match.group(1).strip()[:20]  # Apply 20-char limit
+                    break
+        
+        # Determine if this should replace existing buttons
+        replace_buttons = button_modify_indicators or any(phrase in text_lower for phrase in [
+            "only one button", "just one button", "i need only", "only need", "one button"
+        ])
+        
+        # Force count to 1 when user explicitly asks for "only one"
+        if any(phrase in text_lower for phrase in ["only one button", "just one button", "one button"]):
+            count = 1
+        
         directives.append({"type":"add_buttons","kind":kind,"url": url.group(0) if url else None,
-                           "phone": phone_num, "count": count})
+                           "phone": phone_num, "count": count, "button_text": button_text, 
+                           "replace": replace_buttons})
 
     # Brand / company name (improved detection)
     brand_indicators = (
@@ -705,6 +740,15 @@ def _apply_directives(cfg: Dict[str,Any], directives: list[dict], candidate: Dic
             if cat == "AUTHENTICATION":
                 msgs.append("Buttons aren't allowed for AUTH templates; skipped.")
                 continue
+            
+            # Handle button replacement if requested
+            if d.get("replace"):
+                # Clear existing buttons if user wants replacement
+                for comp in comps:
+                    if (comp.get("type") or "").upper() == "BUTTONS":
+                        comp["buttons"] = []
+                        break
+            
             btn_block = _ensure_buttons()
             if not btn_block:
                 btn_block = {"type":"BUTTONS","buttons":[]}
@@ -712,14 +756,17 @@ def _apply_directives(cfg: Dict[str,Any], directives: list[dict], candidate: Dic
             buttons = btn_block["buttons"]
 
             kind = d.get("kind")
-            count = max(1, min(3, int(d.get("count") or 0))) if kind == "quick" else 1
+            count = d.get("count") or 0
+            
+            # Use specific button text if provided
+            specific_text = d.get("button_text")
 
             if kind == "url":
                 url = d.get("url")
                 if url:
-                    button_text = "Visit Website"[:20]
+                    button_text = (specific_text or "Visit Website")[:20]
                     buttons.append({"type":"URL","text":button_text,"url":url})
-                    msgs.append(f"Added URL button ({button_text}).")
+                    msgs.append(f"Added URL button '{button_text}'.")
                 else:
                     msgs.append("Couldn't find a URL; added quick replies instead.")
                     fallback_qrs = _default_quick_replies(cfg, cat)
@@ -729,17 +776,16 @@ def _apply_directives(cfg: Dict[str,Any], directives: list[dict], candidate: Dic
                     fallback_qrs = fallback_qrs[:space] if space else []
                     if fallback_qrs:
                         buttons.extend(fallback_qrs)
-                    if fallback_qrs:
-                        button_labels = [btn.get("text", "") for btn in fallback_qrs[:MAX_BUTTONS]]
+                        button_labels = [btn.get("text", "") for btn in fallback_qrs]
                         labels_str = " / ".join(button_labels)
                         msgs.append(f"Added {len(fallback_qrs)} quick replies ({labels_str}).")
             elif kind == "phone":
                 phone = d.get("phone")
                 if phone:
-                    button_text = "Call Us"[:20]
+                    button_text = (specific_text or "Call Us")[:20]
                     normalized_phone = _normalize_phone(phone)
                     buttons.append({"type":"PHONE_NUMBER","text":button_text,"phone_number":normalized_phone})
-                    msgs.append(f"Added phone button ({button_text}).")
+                    msgs.append(f"Added phone button '{button_text}'.")
                 else:
                     msgs.append("Couldn't find a phone number; added quick replies instead.")
                     fallback_qrs = _default_quick_replies(cfg, cat)
@@ -749,55 +795,61 @@ def _apply_directives(cfg: Dict[str,Any], directives: list[dict], candidate: Dic
                     fallback_qrs = fallback_qrs[:space] if space else []
                     if fallback_qrs:
                         buttons.extend(fallback_qrs)
-                    if fallback_qrs:
-                        button_labels = [btn.get("text", "") for btn in fallback_qrs[:MAX_BUTTONS]]
+                        button_labels = [btn.get("text", "") for btn in fallback_qrs]
                         labels_str = " / ".join(button_labels)
                         msgs.append(f"Added {len(fallback_qrs)} quick replies ({labels_str}).")
             else:
-                # Get business context for smart button generation
-                brand = memory.get("brand_name", "")
-                business_context = memory.get("business_context", "")
-                qrs = _default_quick_replies(cfg, cat, brand, business_context)
-                if count and count < len(qrs): qrs = qrs[:count]
-                if qrs:
-                    # Don't exceed MAX_BUTTONS when adding contextual quick replies
-                    existing = len(buttons)
-                    space = max(0, MAX_BUTTONS - existing)
-                    qrs = qrs[:space] if space else []
-                    if qrs:
-                        # Enforce button text length limit before adding
-                        for q in qrs:
-                            q["text"] = str(q.get("text","")).strip()[:20]
-                        buttons.extend(qrs)
-                    # Create confirmation with actual button labels (up to MAX_BUTTONS) from all buttons in this component
-                    all_button_labels = [btn.get("text", "") for btn in buttons[:MAX_BUTTONS]]
-                    if len(all_button_labels) <= MAX_BUTTONS:
-                        labels_str = " / ".join(all_button_labels)
-                        msgs.append(f"Added {len(buttons)} quick replies ({labels_str}).")
-                    else:
-                        labels_str = " / ".join(all_button_labels[:MAX_BUTTONS])
-                        msgs.append(f"Added {len(buttons)} quick replies ({labels_str} + {len(buttons)-MAX_BUTTONS} more).")
+                # Handle specific button text if provided
+                if specific_text:
+                    buttons.append({"type":"QUICK_REPLY","text":specific_text[:20]})
+                    msgs.append(f"Added button '{specific_text[:20]}'.")
                 else:
-                    # Fallback if no defaults configured
-                    fallback_buttons = [{"type":"QUICK_REPLY","text":"Learn More"}, {"type":"QUICK_REPLY","text":"Contact Us"}]
-                    # Don't exceed MAX_BUTTONS when adding fallback buttons
-                    existing = len(buttons)
-                    space = max(0, MAX_BUTTONS - existing)
-                    fallback_buttons = fallback_buttons[:space] if space else []
-                    if fallback_buttons:
-                        buttons.extend(fallback_buttons)
-                    # Create confirmation with actual fallback button labels from all buttons
-                    all_button_labels = [btn.get("text", "") for btn in buttons[:MAX_BUTTONS]]
-                    labels_str = " / ".join(all_button_labels)
-                    msgs.append(f"Added {len(buttons)} quick replies ({labels_str}).")
+                    # Get business context for smart button generation
+                    brand = memory.get("brand_name", "")
+                    business_context = memory.get("business_context", "")
+                    qrs = _default_quick_replies(cfg, cat, brand, business_context)
+                    
+                    # Apply count limit if specified
+                    if count > 0:
+                        qrs = qrs[:count]
+                    
+                    if qrs:
+                        # Don't exceed MAX_BUTTONS when adding contextual quick replies
+                        existing = len(buttons)
+                        space = max(0, MAX_BUTTONS - existing)
+                        qrs = qrs[:space] if space else []
+                        if qrs:
+                            # Enforce button text length limit before adding
+                            for q in qrs:
+                                q["text"] = str(q.get("text","")).strip()[:20]
+                            buttons.extend(qrs)
+                    else:
+                        # Fallback if no defaults configured
+                        fallback_count = count if count > 0 else 2
+                        fallback_buttons = [{"type":"QUICK_REPLY","text":"Learn More"}, {"type":"QUICK_REPLY","text":"Contact Us"}][:fallback_count]
+                        # Don't exceed MAX_BUTTONS when adding fallback buttons
+                        existing = len(buttons)
+                        space = max(0, MAX_BUTTONS - existing)
+                        fallback_buttons = fallback_buttons[:space] if space else []
+                        if fallback_buttons:
+                            buttons.extend(fallback_buttons)
             
             # Deduplicate and cap buttons after adding them
             if buttons:
                 buttons = _cap_buttons(buttons)
+                # Apply count limit after capping if specified
+                if count > 0:
+                    buttons = buttons[:count]
                 # Update the component with processed buttons
                 btn_block = _ensure_buttons()
                 if btn_block:
                     btn_block["buttons"] = buttons
+                
+                # Create confirmation with actual button labels
+                button_labels = [btn.get("text", "") for btn in buttons]
+                labels_str = " / ".join(button_labels)
+                if not any("Added" in msg for msg in msgs[-3:]):  # Avoid duplicate confirmations
+                    msgs.append(f"Added {len(buttons)} button{'s' if len(buttons) > 1 else ''} ({labels_str}).")
             
             out["components"] = comps
 
@@ -1638,7 +1690,7 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         missing = list(dict.fromkeys(llm_missing + core))
         
         # Force completion if all required fields are actually present
-        if not computed_missing:
+        if not computed_missing and not memory.get("wants_header") and not memory.get("wants_footer") and not memory.get("wants_buttons"):
             missing = []
             # Create a clean final payload
             final_payload = {
@@ -1657,7 +1709,11 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
                     for c in final_payload.get("components", []))
             )
             
-            if has_all_required:
+            # Only auto-complete if user explicitly confirms or we have 5+ turns
+            user_confirms_completion = _is_affirmation(safe_message) or "complete" in safe_message.lower() or "finalize" in safe_message.lower()
+            many_turns = len(msgs) >= 10
+            
+            if has_all_required and (user_confirms_completion or many_turns):
                 # Override LLM action and force immediate completion
                 out["agent_action"] = "FINAL"
                 out["final_creation_payload"] = final_payload
@@ -1692,19 +1748,28 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
 
         final_reply = (reply or _targeted_missing_reply(missing, memory)).strip()
 
-        # If we applied deterministic edits and the LLM reply is generic, override with a helpful confirmation
-        if (msgs_applied) and (not reply or reply.strip().lower().startswith("please tell me more") or 
-                              "what quick reply buttons" in reply.lower() or "what specific buttons" in reply.lower() or
-                              "what buttons would you like" in reply.lower()):
-            final_reply = "; ".join(msgs_applied) + " Anything else to add?"
-        
-        # Special handling for button confirmations - prioritize our detailed confirmations
-        elif (msgs_applied and any("quick replies" in msg for msg in msgs_applied) and 
-              _has_component(merged, "BUTTONS")):
-            final_reply = "; ".join(msgs_applied) + " Anything else to add?"
+        # Only use directive feedback when LLM response is missing or truly generic
+        if not reply and msgs_applied:
+            # If no LLM reply, use directive messages
+            final_reply = "; ".join(msgs_applied) + ". Anything else?"
+        elif reply and msgs_applied and len(reply.strip()) < 15:
+            # Only override very short LLM responses
+            final_reply = "; ".join(msgs_applied) + ". " + reply
+        elif not reply:
+            # Fallback when no LLM response at all
+            final_reply = _targeted_missing_reply(missing, memory)
 
-        # Add encouragement and examples from friendly_prompts when appropriate
-        if len(msgs) > 0 and any(extras_present.values()):
+        # Add encouragement sparingly - only at key milestones and when appropriate
+        should_encourage = (
+            len(msgs) > 4 and  # After several turns
+            any(extras_present.values()) and  # When user has made progress
+            not msgs_applied and  # Not when we have directive feedback
+            len(final_reply) < 80 and  # Short replies only
+            not _is_affirmation(safe_message) and  # Not after confirmations
+            random.random() < 0.3  # Only 30% chance to avoid overwhelming
+        )
+        
+        if should_encourage:
             encouragement = random.choice(get_encouragement_messages())
             final_reply = f"{encouragement} {final_reply}"
         
@@ -1718,22 +1783,9 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
                     example = random.choice(category_examples)
                     final_reply += f"\n\nHere's an example: {example}"
 
-        # Only apply stale overrides if we don't have deterministic messages from directives
-        deterministic = bool(msgs_applied)
+        # Let LLM handle most responses naturally - only override in very specific cases
+        # Remove deterministic overrides that were blocking natural conversation
         
-        if not deterministic and _has_component(merged, "BUTTONS") and "button" in final_reply.lower():
-            # Build message from actual button texts in the draft
-            btn_comp = next((c for c in (merged.get("components") or []) if (c.get("type") or "").upper() == "BUTTONS"), None)
-            if btn_comp:
-                labels = [b.get("text","").strip() for b in (btn_comp.get("buttons") or []) if b.get("text")]
-                shown = ", ".join(labels[:MAX_BUTTONS]) if labels else "your quick replies"
-                final_reply = f"Added quick replies ({shown}). Anything else to add?"
-            else:
-                final_reply = "Added quick reply buttons. Anything else to add?"
-        if not deterministic and extras_present["header"] and "header" in final_reply.lower():
-            final_reply = "Added a short TEXT header. Anything else to add?"
-        if not deterministic and extras_present["footer"] and "footer" in final_reply.lower():
-            final_reply = "Added a short footer. Anything else to add?"
         return await _persist_turn_and_return(final_reply, merged, missing)
 
     # 7) FINAL → sanitize -> validate -> persist (also enforce requested extras)
