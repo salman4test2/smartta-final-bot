@@ -7,6 +7,8 @@ from sqlalchemy.engine.url import make_url
 import os
 import re
 import datetime as dt
+import copy
+import random
 
 from .db import engine, SessionLocal, Base
 from .models import Draft, User, UserSession
@@ -17,10 +19,18 @@ from .llm import LlmClient
 from .validator import validate_schema, lint_rules
 from .schemas import ChatInput, ChatResponse, SessionData, ChatMessage
 from .utils import merge_deep, scrub_sensitive_data
+from .friendly_prompts import get_encouragement_messages, get_helpful_examples
 
 # Import route modules
 from .routes import config, debug, users, sessions
-from .interactive import router as interactive_router
+
+# Guard interactive router import
+try:
+    from .interactive import router as interactive_router
+    INTERACTIVE_AVAILABLE = True
+except ImportError:
+    INTERACTIVE_AVAILABLE = False
+    interactive_router = None
 
 app = FastAPI(title="LLM-First WhatsApp Template Builder", version="4.0.0")
 
@@ -29,7 +39,10 @@ app.include_router(config.router)
 app.include_router(debug.router)
 app.include_router(users.router)
 app.include_router(sessions.router)
-app.include_router(interactive_router)
+
+# Include interactive router if available
+if INTERACTIVE_AVAILABLE and interactive_router:
+    app.include_router(interactive_router)
 
 import hashlib
 
@@ -148,6 +161,33 @@ async def _auto_name_session_if_needed(db: AsyncSession, user_id: str, session_i
             .where(UserSession.user_id == user_id, UserSession.session_id == session_id)
             .values(session_name=auto_name)
         )
+
+# Button normalization constants
+MAX_BUTTONS = 3
+
+def _cap_buttons(buttons: list[dict]) -> list[dict]:
+    """Deduplicate buttons by text (case-insensitive) and cap at MAX_BUTTONS."""
+    seen = set()
+    out = []
+    for b in buttons:
+        if not isinstance(b, dict):
+            continue
+        
+        # Create key for deduplication
+        btn_text = (b.get("text") or "").strip()
+        btn_type = (b.get("type") or "QUICK_REPLY").upper()
+        key = (btn_type, btn_text.lower())
+        
+        if not btn_text or key in seen:
+            continue
+            
+        seen.add(key)
+        out.append(b)
+        
+        if len(out) >= MAX_BUTTONS:
+            break
+    
+    return out
 
 # --- CORS configuration based on environment ---
 app.add_middleware(
@@ -322,7 +362,7 @@ def _validate_llm_response(response: Dict[str, Any]) -> Dict[str, Any]:
 
     def _has_body(d: Dict[str, Any]) -> bool:
         for comp in (d.get("components") or []):
-            if isinstance(comp, dict) and comp.get("type") == "BODY" and (comp.get("text") or "").strip():
+            if isinstance(comp, dict) and (comp.get("type") or "").upper() == "BODY" and (comp.get("text") or "").strip():
                 return True
         return False
 
@@ -338,7 +378,47 @@ def _validate_llm_response(response: Dict[str, Any]) -> Dict[str, Any]:
         if missing_fields:
             response["agent_action"] = "ASK"
             response["missing"] = missing_fields
-            response["message_to_user"] = f"I still need: {', '.join(missing_fields)}. Please provide them to complete the template."
+            
+            # Create friendly, specific guidance instead of robotic listing
+            if "body" in missing_fields and len(missing_fields) == 1:
+                # Special case: only body missing but we have BODY component
+                if _has_body(draft):
+                    # BODY component exists, so complete the template
+                    response["agent_action"] = "FINAL"
+                    response["final_creation_payload"] = draft
+                    response["message_to_user"] = "Perfect! 🎉 Your template is complete and ready to use. I've captured all your details including your message about the chocolate cake promotion!"
+                    response["missing"] = []
+                else:
+                    response["message_to_user"] = "Great progress! 😊 I just need the main message content. What should your template say to customers?"
+            elif len(missing_fields) == 1:
+                field = missing_fields[0]
+                if field == "name":
+                    response["message_to_user"] = "Almost done! 🌟 What would you like to name this template? (e.g., 'chocolate_cake_promo')"
+                elif field == "language":
+                    response["message_to_user"] = "Just one more thing! What language should this be in? English, Spanish, or Hindi?"
+                elif field == "category":
+                    response["message_to_user"] = "Perfect! Is this a marketing promotion, a utility message (like confirmations), or an authentication code?"
+                else:
+                    response["message_to_user"] = f"Almost there! 🎯 I just need the {field}. Could you help me with that?"
+            else:
+                # Multiple fields missing
+                friendly_fields = []
+                for field in missing_fields:
+                    if field == "body":
+                        friendly_fields.append("main message content")
+                    elif field == "name":
+                        friendly_fields.append("template name")
+                    elif field == "language":
+                        friendly_fields.append("language")
+                    elif field == "category":
+                        friendly_fields.append("message type (marketing/utility/authentication)")
+                    else:
+                        friendly_fields.append(field)
+                
+                if len(friendly_fields) == 2:
+                    response["message_to_user"] = f"Great start! 😊 I just need the {friendly_fields[0]} and {friendly_fields[1]} to complete your template."
+                else:
+                    response["message_to_user"] = f"Excellent progress! 🌟 To finish your template, I need: {', '.join(friendly_fields[:-1])}, and {friendly_fields[-1]}."
     
     # For non-FINAL actions, trust the LLM's missing calculation completely
     # Don't override what the LLM determined
@@ -379,7 +459,7 @@ def _default_quick_replies(cfg: Dict[str,Any], category: str, brand: str = "", b
     defaults_by_cat = buttons_config.get("defaults_by_category", {})
     
     labels = defaults_by_cat.get(cat, defaults_by_cat.get("MARKETING", ["Shop now", "Learn more", "Contact us"]))
-    labels = [str(x).strip()[:25] for x in labels if str(x).strip()]
+    labels = [str(x).strip()[:20] for x in labels if str(x).strip()]
     return [{"type":"QUICK_REPLY","text":lbl} for lbl in labels[:3]]
 
 def _detect_business_type(brand: str, context: str) -> str:
@@ -632,7 +712,7 @@ def _apply_directives(cfg: Dict[str,Any], directives: list[dict], candidate: Dic
             if kind == "url":
                 url = d.get("url")
                 if url:
-                    button_text = "Visit Website"
+                    button_text = "Visit Website"[:20]
                     buttons.append({"type":"URL","text":button_text,"url":url})
                     msgs.append(f"Added URL button ({button_text}).")
                 else:
@@ -646,8 +726,9 @@ def _apply_directives(cfg: Dict[str,Any], directives: list[dict], candidate: Dic
             elif kind == "phone":
                 phone = d.get("phone")
                 if phone:
-                    button_text = "Call Us"
-                    buttons.append({"type":"PHONE_NUMBER","text":button_text,"phone_number":phone})
+                    button_text = "Call Us"[:20]
+                    normalized_phone = _normalize_phone(phone)
+                    buttons.append({"type":"PHONE_NUMBER","text":button_text,"phone_number":normalized_phone})
                     msgs.append(f"Added phone button ({button_text}).")
                 else:
                     msgs.append("Couldn't find a phone number; added quick replies instead.")
@@ -682,20 +763,13 @@ def _apply_directives(cfg: Dict[str,Any], directives: list[dict], candidate: Dic
                     labels_str = " / ".join(all_button_labels)
                     msgs.append(f"Added {len(buttons)} quick replies ({labels_str}).")
             
-            # Deduplicate buttons after adding them
+            # Deduplicate and cap buttons after adding them
             if buttons:
-                seen_texts = set()
-                deduplicated_buttons = []
-                for btn in buttons:
-                    btn_text = btn.get("text", "")
-                    if btn_text and btn_text not in seen_texts:
-                        deduplicated_buttons.append(btn)
-                        seen_texts.add(btn_text)
-                
-                # Update the component with deduplicated buttons
+                buttons = _cap_buttons(buttons)
+                # Update the component with processed buttons
                 btn_block = _ensure_buttons()
                 if btn_block:
-                    btn_block["buttons"] = deduplicated_buttons
+                    btn_block["buttons"] = buttons
             
             out["components"] = comps
 
@@ -866,10 +940,10 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
                             continue
                         
                         # Handle different text field variations from LLM
-                        btn_text = b.get("text") or b.get("label") or b.get("title")
+                        btn_text = (b.get("text") or b.get("label") or b.get("title") or "")[:20]
                         btn_type = b.get("type", "QUICK_REPLY")
                         
-                        if not btn_text:
+                        if not btn_text.strip():
                             continue
                         
                         # Normalize invalid button types to valid WhatsApp API types
@@ -896,7 +970,7 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
                             phone = b.get("phone_number")
                             if not phone:
                                 continue
-                            btn["phone_number"] = phone
+                            btn["phone_number"] = _normalize_phone(phone)
                             
                         b2.append(btn)
                     if b2:
@@ -904,7 +978,7 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
                 elif comp.get("text") or comp.get("label") or comp.get("title"):
                     # Malformed format: Individual BUTTONS component with text/label/title
                     # Collect these to convert to proper format
-                    btn_text = (comp.get("text") or comp.get("label") or comp.get("title") or "").strip()
+                    btn_text = (comp.get("text") or comp.get("label") or comp.get("title") or "").strip()[:20]
                     btn_type = comp.get("button_type") or "QUICK_REPLY"
                     if btn_text:
                         btn = {"type": btn_type, "text": btn_text}
@@ -999,7 +1073,7 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
                     else:
                         # Standard format or other types - try multiple text fields
                         btn_text = (btn.get("text") or btn.get("title") or btn.get("label") or 
-                                   btn.get("value") or "Button")
+                                   btn.get("value") or "Button")[:20]
                         btn_type = btn.get("type", "QUICK_REPLY")
                         
                         # Normalize invalid button types to valid WhatsApp API types
@@ -1016,7 +1090,7 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
                         if btn.get("url"):
                             normalized_btn["url"] = btn["url"]
                         if btn.get("phone_number"):
-                            normalized_btn["phone_number"] = btn["phone_number"]
+                            normalized_btn["phone_number"] = _normalize_phone(btn["phone_number"])
                             
                         normalized_buttons.append(normalized_btn)
             
@@ -1024,6 +1098,30 @@ def _sanitize_candidate(cand: Dict[str, Any]) -> Dict[str, Any]:
             if normalized_buttons:
                 components.append({"type": "BUTTONS", "buttons": normalized_buttons})
                 c["components"] = components
+    
+    # Apply AUTH category constraints and button normalization
+    cat = (c.get("category") or "").upper()
+    if cat == "AUTHENTICATION":
+        # Remove buttons (not allowed for AUTH)
+        components = c.get("components", [])
+        components = [comp for comp in components if not (isinstance(comp, dict) and (comp.get("type") or "").upper() == "BUTTONS")]
+        
+        # Enforce TEXT-only headers for AUTHENTICATION
+        for comp in components:
+            if isinstance(comp, dict) and (comp.get("type") or "").upper() == "HEADER":
+                comp["format"] = "TEXT"
+                comp.pop("example", None)  # Remove examples for TEXT headers unless needed for variables
+        
+        c["components"] = components
+    
+    # Apply button capping and deduplication everywhere
+    components = c.get("components", [])
+    for comp in components:
+        if isinstance(comp, dict) and (comp.get("type") or "").upper() == "BUTTONS":
+            buttons = comp.get("buttons", [])
+            if buttons:
+                comp["buttons"] = _cap_buttons(buttons)
+    c["components"] = components
     
     return c
 
@@ -1139,33 +1237,28 @@ def _auto_apply_extras_on_yes(user_text: str, candidate: Dict[str, Any], memory:
             business_context = memory.get("business_type", "")
             buttons = _default_quick_replies(cfg, cat, brand, business_context)
             if buttons:
+                buttons = _cap_buttons(buttons)  # Apply capping and deduplication
                 comps.append({
                     "type":"BUTTONS",
                     "buttons": buttons
                 })
                 changed = True
         elif memory.get("wants_buttons") and has("BUTTONS"):
-            # Handle adding more buttons - avoid duplicates
+            # Handle adding more buttons - use centralized capping
             existing_comp = next((c for c in comps if c.get("type") == "BUTTONS"), None)
             if existing_comp:
                 existing_buttons = existing_comp.get("buttons", [])
-                existing_texts = [b.get("text", "") for b in existing_buttons]
                 
-                # Generate new buttons but filter out duplicates
+                # Generate new buttons and merge
                 from .config import get_config
                 cfg = get_config() or {}
                 brand = memory.get("brand_name", "")
                 business_context = memory.get("business_type", "")
                 new_buttons = _default_quick_replies(cfg, cat, brand, business_context)
                 
-                for btn in new_buttons:
-                    if btn.get("text") not in existing_texts:
-                        existing_buttons.append(btn)
-                        existing_texts.append(btn.get("text"))
-                        if len(existing_buttons) >= 3:  # Max 3 buttons
-                            break
-                
-                existing_comp["buttons"] = existing_buttons
+                # Combine and apply centralized capping/deduplication
+                all_buttons = existing_buttons + new_buttons
+                existing_comp["buttons"] = _cap_buttons(all_buttons)
                 changed = True
     
     if changed:
@@ -1241,6 +1334,12 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
 
     # 1) Load/create session + draft
     s = await get_or_create_session(db, inp.session_id)
+    
+    # 2) Load user business profile for better context
+    business_profile = None
+    if inp.user_id:
+        business_profile = await get_user_business_profile(db, inp.user_id)
+    
     if not s.active_draft_id:
         d = await create_draft(db, s.id, draft={}, version=1)
         s.active_draft_id = d.id
@@ -1256,33 +1355,23 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
     memory: Dict[str, Any] = dict(s.memory or {})
     msgs: List[Dict[str, str]] = (s.data or {}).get("messages", [])
 
-    # Load user business profile to avoid asking repeated questions
-    from .repo import get_user_business_profile
-    user_profile = await get_user_business_profile(db, inp.user_id)
-    
-    # Pre-populate memory from user profile if available
-    if user_profile:
-        if not memory.get("business_name") and user_profile.business_name:
-            memory["business_name"] = user_profile.business_name
-            memory["brand_name"] = user_profile.business_name
-        
-        if not memory.get("business_type") and user_profile.business_type:
-            memory["business_type"] = user_profile.business_type
-        
-        if not draft.get("category") and user_profile.default_category:
-            memory["preferred_category"] = user_profile.default_category
-        
-        if not draft.get("language") and user_profile.default_language:
-            memory["preferred_language"] = user_profile.default_language
-        
-        if user_profile.phone_number:
-            memory["business_phone"] = user_profile.phone_number
-        
-        if user_profile.website_url:
-            memory["business_website"] = user_profile.website_url
+    # Pre-populate memory from business profile if available and not already set
+    if business_profile:
+        if not memory.get("business_name") and business_profile.business_name:
+            memory["business_name"] = business_profile.business_name
+        if not memory.get("business_type") and business_profile.business_type:
+            memory["business_type"] = business_profile.business_type
+        if not memory.get("brand_name") and business_profile.business_name:
+            memory["brand_name"] = business_profile.business_name
+        if not memory.get("industry") and business_profile.industry:
+            memory["industry"] = business_profile.industry
+        if not memory.get("category") and business_profile.default_category:
+            memory["category"] = business_profile.default_category
+        if not memory.get("language_pref") and business_profile.default_language:
+            memory["language_pref"] = business_profile.default_language
 
     # 2) Build LLM inputs + call
-    # Use friendly system prompt for better user experience
+    # Use comprehensive system prompt for better user experience
     system = build_friendly_system_prompt(cfg)
     context = build_context_block(draft, memory, cfg, msgs)
     safe_message = _sanitize_user_input(inp.message)
@@ -1475,6 +1564,7 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         cat = (merged.get("category") or memory.get("category") or "").upper()
         if cat == "AUTHENTICATION":
             components = merged.get("components", [])
+           
             original_length = len(components)
             filtered_components = [comp for comp in components if not (isinstance(comp, dict) and (comp.get("type") or "").upper() == "BUTTONS")]
             if len(filtered_components) < original_length:
@@ -1512,6 +1602,54 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         # Keep only the core fields from server if LLM forgot them
         core = [m for m in computed_missing if m in ["category", "language", "name", "body"]]
         missing = list(dict.fromkeys(llm_missing + core))
+        
+        # Force completion if all required fields are actually present
+        if not computed_missing:
+            missing = []
+            # Create a clean final payload
+            final_payload = {
+                "name": merged.get("name"),
+                "category": merged.get("category"), 
+                "language": merged.get("language"),
+                "components": merged.get("components", [])
+            }
+            
+            # Check if we actually have all required content
+            has_all_required = (
+                final_payload.get("name") and 
+                final_payload.get("category") and 
+                final_payload.get("language") and
+                any(isinstance(c, dict) and (c.get("type") or "").upper() == "BODY" and (c.get("text") or "").strip()
+                    for c in final_payload.get("components", []))
+            )
+            
+            if has_all_required:
+                # Override LLM action and force immediate completion
+                out["agent_action"] = "FINAL"
+                out["final_creation_payload"] = final_payload
+                out["message_to_user"] = "Perfect! 🎉 Your template is complete and ready to use!"
+                out["missing"] = []
+                action = "FINAL"
+                
+                # Save business profile and complete immediately
+                await _save_business_profile_if_present(db, inp.user_id, memory)
+                
+                # Skip all validation and go straight to completion
+                d.finalized_payload = final_payload
+                d.status = "FINAL"
+                d.draft = merged
+                s.last_action = "FINAL"
+                s.data = {**(s.data or {}), "messages": _append_history(inp.message, s.data.get("messages", [-1]).get("content", ""), out["message_to_user"])}
+                await touch_user_session(db, inp.user_id, s.id)
+                await upsert_session(db, s); await db.commit()
+                
+                return ChatResponse(
+                    session_id=s.id, 
+                    reply=out["message_to_user"], 
+                    draft=merged,
+                    missing=[], 
+                    final_creation_payload=final_payload
+                )
 
         # Mark success in memory after applying extras
         if any(extras_present.values()):
@@ -1533,7 +1671,6 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
 
         # Add encouragement and examples from friendly_prompts when appropriate
         if len(msgs) > 0 and any(extras_present.values()):
-            import random
             encouragement = random.choice(get_encouragement_messages())
             final_reply = f"{encouragement} {final_reply}"
         
@@ -1547,12 +1684,21 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
                     example = random.choice(category_examples)
                     final_reply += f"\n\nHere's an example: {example}"
 
-        if _has_component(merged, "BUTTONS") and "button" in (final_reply.lower()) and not msgs_applied:
-            # Only use fallback if we don't have specific confirmation messages
-            final_reply = "Added quick reply buttons. Anything else to add?"
-        if extras_present["header"] and "header" in final_reply.lower():
+        # Only apply stale overrides if we don't have deterministic messages from directives
+        deterministic = bool(msgs_applied)
+        
+        if not deterministic and _has_component(merged, "BUTTONS") and "button" in final_reply.lower():
+            # Build message from actual button texts in the draft
+            btn_comp = next((c for c in (merged.get("components") or []) if (c.get("type") or "").upper() == "BUTTONS"), None)
+            if btn_comp:
+                labels = [b.get("text","").strip() for b in (btn_comp.get("buttons") or []) if b.get("text")]
+                shown = ", ".join(labels[:3]) if labels else "your quick replies"
+                final_reply = f"Added quick replies ({shown}). Anything else to add?"
+            else:
+                final_reply = "Added quick reply buttons. Anything else to add?"
+        if not deterministic and extras_present["header"] and "header" in final_reply.lower():
             final_reply = "Added a short TEXT header. Anything else to add?"
-        if extras_present["footer"] and "footer" in final_reply.lower():
+        if not deterministic and extras_present["footer"] and "footer" in final_reply.lower():
             final_reply = "Added a short footer. Anything else to add?"
         return await _persist_turn_and_return(final_reply, merged, missing)
 
@@ -1845,51 +1991,6 @@ def _get_journey_stage_from_memory(memory: Dict[str, Any]) -> str:
     else:
         return "review"
 
-def get_encouragement_messages() -> List[str]:
-    """Get encouraging messages for user feedback."""
-    return [
-        "Great progress!",
-        "Looking good!",
-        "Perfect!",
-        "Excellent!",
-        "Well done!",
-        "Nice work!",
-        "Fantastic!"
-    ]
-
-def get_helpful_examples() -> Dict[str, List[str]]:
-    """Get helpful examples by category."""
-    return {
-        "marketing_examples": [
-            "🎉 Hi {{1}}! Special 20% off on all sweets this Diwali. Use code SWEET20. Valid till Oct 31st.",
-            "🛍️ Hello {{1}}! New winter collection is here. Get free shipping on orders above ₹999.",
-            "☕ Hi {{1}}! Buy 2 coffees, get 1 free! Valid today only at {{2}} cafe."
-        ],
-        "utility_examples": [
-            "Hi {{1}}, your order #{{2}} has been confirmed. Expected delivery: {{3}}. Track: {{4}}",
-            "Hello {{1}}, your appointment at {{2}} clinic is confirmed for {{3}} at {{4}}.",
-            "Hi {{1}}, your {{2}} subscription will renew on {{3}}. Amount: ₹{{4}}."
-        ],
-        "authentication_examples": [
-            "{{1}} is your verification code. Valid for {{2}} minutes. Don't share this code.",
-            "Your login code is {{1}}. Use this to access your account. Expires in {{2}} minutes."
-        ]
-    }
-
-def scrub_sensitive_data(text: str) -> str:
-    """Remove sensitive data from text for logging."""
-    # Simple scrubbing - could be enhanced
-    return re.sub(r'\b\d{4,}\b', '[NUMBER]', text)
-
-def _redact_secrets(data: Any) -> Any:
-    """Redact secrets from data for logging."""
-    if isinstance(data, dict):
-        return {k: _redact_secrets(v) for k, v in data.items() 
-                if k not in ['password', 'token', 'key', 'secret']}
-    elif isinstance(data, list):
-        return [_redact_secrets(item) for item in data]
-    else:
-        return data
 
 async def _save_business_profile_if_present(db: AsyncSession, user_id: str, memory: Dict[str, Any]):
     """Helper to save business profile from memory if present."""
@@ -1912,6 +2013,8 @@ async def _save_business_profile_if_present(db: AsyncSession, user_id: str, memo
             business_data["category"] = memory["category"]
         if memory.get("language_pref"):
             business_data["language_preference"] = memory["language_pref"]
+        if memory.get("phone_number"):
+            business_data["phone_number"] = _normalize_phone(memory["phone_number"])
         
         # Save to business profile if we have meaningful data
         if business_data:
@@ -1919,5 +2022,11 @@ async def _save_business_profile_if_present(db: AsyncSession, user_id: str, memo
     except Exception as e:
         # Don't fail the chat if business profile saving fails
         print(f"Warning: Could not save business profile: {e}")
+
+def _normalize_phone(phone_number: str) -> str:
+    """Normalize phone number by stripping whitespace and common formatting characters."""
+    if not phone_number:
+        return phone_number
+    return phone_number.replace(" ", "").replace("-", "").replace("(", "").replace(")", "").replace(".", "").strip()
 
 

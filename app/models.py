@@ -183,8 +183,8 @@ class UserBusinessProfile(Base):
     phone_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
     website_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
     
-    # Additional metadata as JSON
-    metadata: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    # Additional profile data as JSON
+    profile_data: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

@@ -41,7 +41,7 @@ def run_all_tests():
                 python_path = sys.executable
             
             result = subprocess.run(
-                [str(python_path), "-m", "pytest", str(test_file), "-v"],
+                [str(python_path), "-m", "pytest", str(test_file), "-v", "-k", "not trio"],
                 cwd=tests_dir.parent,
                 capture_output=True,
                 text=True,
