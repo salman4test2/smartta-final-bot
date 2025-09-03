@@ -192,9 +192,51 @@ def _get_cfg_tone(cfg: Dict[str, Any]) -> str:
     return (((cfg.get("ux") or {}).get("tone") or (cfg.get("responses") or {}).get("tone") or "concise").lower())
 
 
+# --------------------------------------------------------------------------------------
+# Enhanced button and directive helpers
+# --------------------------------------------------------------------------------------
+
+NUM_WORDS = {"one": 1, "two": 2, "three": 3, "1": 1, "2": 2, "3": 3}
+
+def _word_to_int(s: str | None) -> int | None:
+    if not s: return None
+    s = re.sub(r"[^\w]", "", s.strip().lower())
+    return NUM_WORDS.get(s)
+
+def _summarize_buttons_enhanced(btns: list[dict]) -> str:
+    labels = [b.get("text", "").strip() for b in (btns or []) if b.get("text")]
+    labels = [l for l in labels if l]
+    if not labels: return "no buttons"
+    if len(labels) == 1: return f"1 quick reply ({labels[0]})"
+    return f"{len(labels)} quick replies ({' / '.join(labels[:3])})"
+
+def _cap_buttons_enhanced(buttons: list[dict], cap: int) -> list[dict]:
+    # Keep first occurrence per visible text; respect max allowed
+    seen = set()
+    out = []
+    for b in buttons:
+        t = (b.get("text") or "").strip()
+        if not t or t.lower() in seen:
+            continue
+        out.append(b)
+        seen.add(t.lower())
+        if len(out) >= cap:
+            break
+    return out
+
+def _normalize_phone(raw: str | None) -> str | None:
+    if not raw: return None
+    digits = re.sub(r"[^\d+]", "", raw)
+    # naive gate: 10+ digits
+    return digits if len(re.sub(r"\D", "", digits)) >= 10 else None
+
+def _syn(cfg: Dict[str, Any], key: str) -> list[str]:
+    """Get synonyms from config for NLP matching"""
+    return (((cfg.get("nlp") or {}).get("synonyms") or {}).get(key, [key]))
+
 def _cap_buttons(cfg: Dict[str, Any], n: int) -> int:
     try:
-        return max(0, min(int(n), int((((cfg.get("limits") or {}).get("buttons") or {}).get("max_per_template", 3)))))
+        return max(0, min(int(n), int((((cfg.get("components") or {}).get("buttons") or {}).get("max", 3)))))
     except Exception:
         return max(0, min(int(n), 3))
 
@@ -302,87 +344,119 @@ def _ensure_brand_in_body(components: list[dict], brand: str, max_len: int = 102
 
 
 def _parse_user_directives(cfg: Dict[str, Any], text: str) -> list[dict]:
-    """Parse user text -> normalized directives (idempotent, category-safe)."""
+    """Parse user text into normalized directives with strong coverage for buttons, brand, shorten, and set fields."""
     toks = _tokenize(text)
-    text_l = (text or "").lower()
+    lower = (text or "").lower()
+
+    s_add = _syn(cfg, "add")
+    s_btn = _syn(cfg, "button") 
+    s_only = _syn(cfg, "only")
+    s_modify = _syn(cfg, "modify")
+    s_shorten = _syn(cfg, "shorten")
+    s_brand = _syn(cfg, "brand")
+    s_header = _syn(cfg, "header")
+    s_footer = _syn(cfg, "footer")
+    s_body = _syn(cfg, "body")
+    s_name = _syn(cfg, "name")
 
     directives: list[dict] = []
 
-    # --- Buttons (add / set / modify / clear) ---
-    # Common intents: "add button(s)", "need one button", "only one button Get Now",
-    # "modify the button to Get Now", "set buttons to: Buy, Learn More"
-    # 1) explicit set to one label
-    m = re.search(r"\b(?:set|make|use|keep|only|just)\s+(?:one|1)\s+button\s+(?:to\s+)?(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z][\w\s]{1,40}))", text, re.I)
-    if m:
-        label = next(g for g in m.groups() if g)  # pick the filled capture
-        directives.append({"type": "set_buttons", "labels": [label.strip()], "mode": "replace"})
-        return directives  # strongest intent; return early
+    # ---- BUTTONS (explicit labels & modes) ----
+    wants_button = any(w in toks for w in s_btn) or "button" in lower or "buttons" in lower
+    intends_modify = any(w in toks for w in s_modify) or "modify" in lower or "change" in lower or "update" in lower
+    intends_only = any(w in toks for w in s_only) or "only one" in lower or "single button" in lower or "just one" in lower or "exactly one" in lower
 
-    # 2) modify/rename existing single button
-    m = re.search(r"\b(?:modify|change|rename|update)\s+(?:the\s+)?button(?:\s+text)?\s+(?:to|as)\s+(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z][\w\s]{1,40}))", text, re.I)
-    if m:
-        label = next(g for g in m.groups() if g)
-        directives.append({"type": "set_buttons", "labels": [label.strip()], "mode": "replace"})
-        return directives
+    # capture quoted labels "Get Now", 'Shop now'
+    quoted_labels = re.findall(r'["\']([^"\']{1,40})["\']', text)
 
-    # 3) set multiple buttons from a list
-    m = re.search(r"\b(?:set|use|make)\s+buttons?\s*(?:to|as|:)\s*(.+)$", text, re.I)
-    if m:
-        raw = m.group(1)
-        labels = [x.strip().strip('"\'') for x in re.split(r"[,/]|\s{2,}", raw) if x.strip()]
-        labels = [x for x in labels if x]
-        if labels:
-            directives.append({"type": "set_buttons", "labels": labels[:3], "mode": "replace"})
-            return directives
+    # capture raw labels after 'button(s)' or verbs; allow comma-separated
+    raw_after = re.search(r'(?:button(?:s)?(?:\s*(?:to|as|named|label(?:ed)?)\s*)?|modify\s*(?:the)?\s*button(?:s)?\s*(?:to)?)[\s:,-]*(.+)$', lower)
+    trailing_labels = []
+    if raw_after:
+        # take non-URL-ish words, strip punctuation, split by comma
+        tail = text[raw_after.start(1):].strip()
+        parts = [p.strip(" ,.;:") for p in re.split(r",|/| and ", tail) if p.strip()]
+        # filter out obvious noise like numbers without words
+        trailing_labels = [p for p in parts if not re.match(r"^https?://", p, re.I)]
 
-    # 4) need one button (no label provided)
-    if re.search(r"\b(?:need|want|add)\s+(?:one|1)\s+button\b", text_l):
-        directives.append({"type": "add_buttons", "kind": "quick", "count": 1, "mode": "replace"})
-        return directives
+    # decide count
+    num = None
+    # words or digits near 'button'
+    mnum = re.search(r'(?:(?:only|just|single|exactly)\s+)?(one|two|three|[123])\s+button', lower)
+    if mnum:
+        num = _word_to_int(mnum.group(1))
+    if num is None:
+        # fallback: any plain integer anywhere (e.g., "add 1 button")
+        mnum2 = re.search(r'\b([123])\b', lower)
+        if mnum2: 
+            num = _word_to_int(mnum2.group(1))
 
-    # 5) clear/remove buttons
-    if re.search(r"\b(remove|clear|delete)\s+buttons?\b", text_l):
-        directives.append({"type": "clear_buttons"})
+    # extract URL / phone intent (for URL/PHONE buttons)
+    url_match = re.search(r'(https?://[^\s]+)', text, re.I)
+    phone_match = re.search(r'(?:call\s+us\s*(?:at)?\s*)?(\+?[\d\-\s().]{10,})', text, re.I)
+    phone_norm = _normalize_phone(phone_match.group(1)) if phone_match else None
 
-    # 6) generic add button(s) with optional count/URL/phone
-    button_indicators = (
-        ("button" in text_l) or ("buttons" in text_l) or ("quick reply" in text_l) or ("quick replies" in text_l)
-    )
-    if button_indicators:
-        url = URL_RE.search(text)
-        phone = PHONE_RE.search(text)
-        count = _extract_int(text) or 0
-        kind = "quick" if not url and not phone else ("url" if url else "phone")
-        phone_num = phone.group(1) if phone else None
-        directives.append({
-            "type": "add_buttons", "kind": kind, "url": url.group(0) if url else None,
-            "phone": phone_num, "count": count or None
-        })
+    if wants_button or intends_modify:
+        labels = quoted_labels or trailing_labels
+        labels = [re.sub(r"\s+", " ", l).strip() for l in labels]
+        labels = [l for l in labels if l and len(l) <= 25]  # WA 25-char guard
 
-    # --- Brand ---
-    if any(w in text_l for w in ["company name", "brand name", "organization", "brand", "company"]):
+        # default kind
+        kind = "quick"
+        if url_match:
+            kind = "url"
+        elif phone_norm:
+            kind = "phone"
+
+        # explicit modify/replace case
+        if intends_modify or intends_only:
+            directives.append({
+                "type": "set_buttons",     # replace exact
+                "kind": kind,
+                "labels": labels[:3] if labels else None,
+                "url": url_match.group(1) if url_match else None,
+                "phone": phone_norm,
+                "count": num or (1 if intends_only else None)
+            })
+        else:
+            # additive (still bounded/capped later)
+            directives.append({
+                "type": "add_buttons",
+                "kind": kind,
+                "labels": labels[:3] if labels else None,
+                "url": url_match.group(1) if url_match else None,
+                "phone": phone_norm,
+                "count": num or (len(labels) if labels else None)
+            })
+
+    # ---- BRAND ----
+    if any(w in toks for w in s_brand) or "company name" in lower or "brand name" in lower:
         brand = _extract_brand_name(text)
         if brand:
             directives.append({"type": "set_brand", "name": brand})
 
-    # --- Shorten ---
-    if any(p in text_l for p in ["make it short", "shorten", "condense", "trim", "shorter"]):
-        target = _extract_int(text) or int((((get_config().get("components") or {}).get("text") or {}).get("shorten", {}).get("target_length", 140)))
-        directives.append({"type": "shorten", "target": target})
+    # ---- SHORTEN ----
+    if any(w in toks for w in s_shorten) or "make it short" in lower or "make it shorter" in lower:
+        target = _extract_int(text) or (((cfg.get("components") or {}).get("text") or {}).get("shorten", {}).get("target_length", 140))
+        directives.append({"type": "shorten", "target": int(target)})
 
-    # --- Flat setters (header/footer/body/name) ---
-    m = re.search(r'name\s*(?:is|=|as)?\s*"?([a-z0-9_]{1,64})"?', text, re.I)
-    if m:
-        directives.append({"type": "set_name", "name": m.group(1)})
-    m = re.search(r'(?:body|message|text|content)\s*(?:is|=|:)\s*"(.+?)"', text, re.I|re.S)
-    if m:
-        directives.append({"type": "set_body", "text": m.group(1).strip()})
-    m = re.search(r'header\s*(?:is|=|:)\s*"(.+?)"', text, re.I|re.S)
-    if m:
-        directives.append({"type": "set_header", "format": "TEXT", "text": m.group(1).strip()})
-    m = re.search(r'footer\s*(?:is|=|:)\s*"(.+?)"', text, re.I|re.S)
-    if m:
-        directives.append({"type": "set_footer", "text": m.group(1).strip()})
+    # ---- Setters if explicit key:value ----
+    if any(w in toks for w in s_name):
+        m = re.search(r'name\s*(?:is|=|as)?\s*["]?([a-z0-9_]{1,64})["]?', text, re.I)
+        if m: 
+            directives.append({"type": "set_name", "name": m.group(1)})
+    if any(w in toks for w in s_body):
+        m = re.search(r'(?:body|message|text|content)\s*(?:is|=|:)\s*[""](.+?)[""]', text, re.I|re.S)
+        if m: 
+            directives.append({"type": "set_body", "text": m.group(1).strip()})
+    if any(w in toks for w in s_header):
+        m = re.search(r'header\s*(?:is|=|:)\s*[""](.+?)[""]', text, re.I|re.S)
+        if m: 
+            directives.append({"type": "set_header", "format": "TEXT", "text": m.group(1).strip()})
+    if any(w in toks for w in s_footer):
+        m = re.search(r'footer\s*(?:is|=|:)\s*[""](.+?)[""]', text, re.I|re.S)
+        if m: 
+            directives.append({"type": "set_footer", "text": m.group(1).strip()})
 
     return directives
 
@@ -421,119 +495,117 @@ def _summarize_header(components: list[dict]) -> str:
     return ""
 
 
-def _apply_directives(cfg: Dict[str, Any], directives: list[dict], candidate: Dict[str, Any], memory: Dict[str, Any]) -> tuple[Dict[str, Any], List[str]]:
+def _apply_directives(cfg: Dict[str, Any], directives: list[dict], candidate: Dict[str, Any], memory: Dict[str, Any]) -> tuple[Dict[str, Any], list[str]]:
+    """Apply normalized directives in a category-safe, schema-safe way with exact replace support for buttons."""
     out = dict(candidate or {})
-    comps: list[dict] = list(out.get("components") or [])
+    comps = list(out.get("components") or [])
     cat = (out.get("category") or memory.get("category") or "").upper()
-    msgs: List[str] = []
+    msgs: list[str] = []
 
-    def _ensure_buttons():
-        blk = _ensure_buttons_block(comps)
-        if not blk:
-            blk = {"type": "BUTTONS", "buttons": []}
-            comps.append(blk)
-        return blk
+    def _get_buttons_block():
+        return next((c for c in comps if (c.get("type") or "").upper() == "BUTTONS"), None)
+
+    max_btns = int((((cfg.get("components") or {}).get("buttons") or {}).get("max", 3)) or 3)
 
     for d in directives:
         t = d.get("type")
 
-        # Clear all buttons
-        if t == "clear_buttons":
-            comps = [c for c in comps if (c.get("type") or "").upper() != "BUTTONS"]
-            msgs.append("Removed all buttons.")
-            out["components"] = comps
-            continue
-
-        # Set exact buttons (replace mode)
+        # ---------- BUTTONS: REPLACE EXACT ----------
         if t == "set_buttons":
             if cat == "AUTHENTICATION":
                 msgs.append("Buttons aren't allowed for AUTH templates; skipped.")
                 continue
-            labels = [str(x).strip() for x in (d.get("labels") or []) if str(x).strip()]
-            labels = list(dict.fromkeys(labels))  # de-dup keep order
-            labels = labels[:_cap_buttons(cfg, len(labels))]
-            if not labels:
-                # if empty list → remove block
-                comps = [c for c in comps if (c.get("type") or "").upper() != "BUTTONS"]
-                out["components"] = comps
-                msgs.append("Removed all buttons.")
-                continue
-            # replace entirely
-            comps = [c for c in comps if (c.get("type") or "").upper() != "BUTTONS"]
-            comps.append({"type": "BUTTONS", "buttons": [{"type": "QUICK_REPLY", "text": l[:20]} for l in labels]})
-            out["components"] = comps
-            labels_s = " / ".join(labels)
-            msgs.append(f"Set buttons: {labels_s}.")
-            continue
 
-        if t == "add_buttons":
+            # build exactly from directive
+            labels = d.get("labels") or []
+            kind = d.get("kind") or "quick"
+            btns: list[dict] = []
+
+            if kind == "url" and d.get("url"):
+                # single URL button; ignore any extra labels
+                btns = [{"type": "URL", "text": labels[0] if labels else "Visit Website", "url": d["url"]}]
+            elif kind == "phone" and d.get("phone"):
+                btns = [{"type": "PHONE_NUMBER", "text": labels[0] if labels else "Call Us", "phone_number": d["phone"]}]
+            else:
+                # quick replies
+                if not labels:
+                    # no labels → fall back to contextual defaults
+                    brand = memory.get("brand_name", "")
+                    biz = memory.get("business_context") or memory.get("business_type", "")
+                    labels = [b["text"] for b in _default_quick_replies(cfg, cat, brand, biz)]
+                btns = [{"type": "QUICK_REPLY", "text": l[:20]} for l in labels]
+
+            btns = _cap_buttons_enhanced(btns, max_btns)
+            # replace component
+            comps = [c for c in comps if (c.get("type") or "").upper() != "BUTTONS"]
+            if btns:
+                comps.append({"type": "BUTTONS", "buttons": btns})
+            out["components"] = comps
+            msgs.append(f"Set buttons to: {', '.join(b.get('text') for b in btns)}.")
+
+        # ---------- BUTTONS: ADDITIVE ----------
+        elif t == "add_buttons":
             if cat == "AUTHENTICATION":
                 msgs.append("Buttons aren't allowed for AUTH templates; skipped.")
                 continue
 
-            # Replace mode if explicitly requested (e.g., need one button)
-            mode = (d.get("mode") or "append").lower()
-            btn_block = _ensure_buttons() if mode == "append" else None
-            if mode == "replace":
-                comps = [c for c in comps if (c.get("type") or "").upper() != "BUTTONS"]
-                btn_block = {"type": "BUTTONS", "buttons": []}
-                comps.append(btn_block)
-
-            buttons = btn_block["buttons"]
             kind = d.get("kind") or "quick"
+            labels = d.get("labels") or []
             count = d.get("count")
 
+            btn_block = _get_buttons_block()
+            if not btn_block:
+                btn_block = {"type": "BUTTONS", "buttons": []}
+                comps.append(btn_block)
+            buttons = list(btn_block.get("buttons") or [])
+
             if kind == "url" and d.get("url"):
-                buttons[:] = [{"type": "URL", "text": "Visit Website", "url": d["url"]}]
+                buttons.append({"type": "URL", "text": labels[0] if labels else "Visit Website", "url": d["url"]})
             elif kind == "phone" and d.get("phone"):
-                buttons[:] = [{"type": "PHONE_NUMBER", "text": "Call Us", "phone_number": d["phone"]}]
+                buttons.append({"type": "PHONE_NUMBER", "text": labels[0] if labels else "Call Us", "phone_number": d["phone"]})
             else:
-                brand = memory.get("brand_name", "")
-                bctx = memory.get("business_type", "") or memory.get("business_context", "")
-                qrs = _default_quick_replies(cfg, cat, brand, bctx)
-                if count:
-                    qrs = qrs[:_cap_buttons(cfg, count)]
-                buttons[:] = qrs
+                # quick: use labels if given, else contextual defaults
+                if labels:
+                    new = [{"type": "QUICK_REPLY", "text": l[:20]} for l in labels]
+                else:
+                    brand = memory.get("brand_name", "")
+                    biz = memory.get("business_context") or memory.get("business_type", "")
+                    new = _default_quick_replies(cfg, cat, brand, biz)
+                    if count: 
+                        new = new[:max(1, min(max_btns, int(count)))]
+                buttons.extend(new)
 
+            btn_block["buttons"] = _cap_buttons_enhanced(buttons, max_btns)
             out["components"] = comps
-            labels = _summarize_buttons(comps)
-            if labels:
-                msgs.append(f"Added buttons: {labels}.")
-            continue
+            msgs.append(f"Added {_summarize_buttons_enhanced(btn_block['buttons'])}.")
 
-        if t == "set_brand":
+        # ---------- BRAND ----------
+        elif t == "set_brand":
             brand = (d.get("name") or "").strip()
-            if not brand:
-                continue
-            memory["brand_name"] = brand
-            new_comps = _ensure_brand_in_body(comps, brand)
-            if new_comps is comps:
-                memory["brand_name_pending"] = brand
-                msgs.append(f"Stored brand '{brand}'. Will add when BODY is present.")
-            else:
-                comps = new_comps
-                msgs.append(f"Added company name '{brand}' to BODY.")
-            out["components"] = comps
-            continue
+            if brand:
+                memory["brand_name"] = brand
+                comps = _ensure_brand_in_body(comps, brand)
+                out["components"] = comps
+                msgs.append(f'Added company name "{brand}" to BODY.')
 
-        if t == "shorten":
-            target = int(d.get("target") or 140)
+        # ---------- SHORTEN ----------
+        elif t == "shorten":
+            target = int(d.get("target") or ((cfg.get("components") or {}).get("text") or {}).get("shorten", {}).get("target_length", 140))
             for c in comps:
                 if (c.get("type") or "").upper() == "BODY" and (c.get("text") or "").strip():
                     c["text"] = _shorten_text(c["text"], target)
                     msgs.append(f"Shortened BODY to ≈{target} chars.")
                     break
             out["components"] = comps
-            continue
 
-        if t == "set_name":
+        # ---------- NAME/BODY/HEADER/FOOTER ----------
+        elif t == "set_name":
             out["name"] = _slug(d.get("name"))
             msgs.append(f"Set name: {out['name']}")
-            continue
-
-        if t == "set_body":
+        elif t == "set_body":
             txt = (d.get("text") or "").strip()
             if txt:
+                # replace or insert first BODY
                 replaced = False
                 for c in comps:
                     if (c.get("type") or "").upper() == "BODY":
@@ -542,13 +614,9 @@ def _apply_directives(cfg: Dict[str, Any], directives: list[dict], candidate: Di
                         break
                 if not replaced:
                     comps.insert(0, {"type": "BODY", "text": txt})
-                if memory.get("brand_name_pending"):
-                    comps = _ensure_brand_in_body(comps, memory.pop("brand_name_pending"))
-                msgs.append("Updated BODY.")
                 out["components"] = comps
-            continue
-
-        if t == "set_header":
+                msgs.append("Set BODY.")
+        elif t == "set_header":
             fmt = (d.get("format") or "TEXT").upper()
             if cat == "AUTHENTICATION" and fmt != "TEXT":
                 msgs.append("For AUTH, only TEXT header is allowed; skipped non-TEXT header.")
@@ -557,15 +625,11 @@ def _apply_directives(cfg: Dict[str, Any], directives: list[dict], candidate: Di
             h = {"type": "HEADER", "format": fmt}
             if fmt == "TEXT":
                 txt = (d.get("text") or "").strip()
-                if txt:
+                if txt: 
                     h["text"] = txt[:60]
-            comps.insert(0, h)
-            out["components"] = comps
-            sh = _summarize_header(comps)
-            msgs.append(f"Updated header ({sh or fmt}).")
-            continue
-
-        if t == "set_footer":
+            out["components"] = [h] + comps
+            msgs.append("Set HEADER.")
+        elif t == "set_footer":
             txt = (d.get("text") or "").strip()
             seen = False
             for c in comps:
@@ -573,11 +637,10 @@ def _apply_directives(cfg: Dict[str, Any], directives: list[dict], candidate: Di
                     c["text"] = txt[:60]
                     seen = True
                     break
-            if not seen and txt:
+            if not seen: 
                 comps.append({"type": "FOOTER", "text": txt[:60]})
             out["components"] = comps
-            msgs.append("Updated footer.")
-            continue
+            msgs.append("Set FOOTER.")
 
     return out, msgs
 
@@ -1037,32 +1100,25 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         missing = list(dict.fromkeys(llm_missing + core))
 
         # Compose reply (concise, deterministic if we applied edits)
-        tone = _get_cfg_tone(cfg)
+        ui_cfg = (cfg.get("ui") or {})
+        enc_cfg = (ui_cfg.get("encouragement") or {})
+        tone = (ui_cfg.get("tone") or "neutral").lower()
+        enc_enabled = bool(enc_cfg.get("enabled", False))
+        
         if msgs_applied:
             # If LLM gave nothing or generic, replace; else append succinctly
             if not reply or reply.lower().startswith("please tell me more"):
-                reply = "; ".join(msgs_applied)
+                reply = "; ".join(msgs_applied) + ". Anything else to add?"
             else:
                 reply = (reply + "\n\nApplied: " + "; ".join(msgs_applied)).strip()
         if not reply:
             reply = _targeted_missing_reply(missing, memory)
 
-        # Avoid any hard-coded confirmations; use dynamic summaries
-        if _has_component(candidate, "BUTTONS") and ("button" in reply.lower() or reply.lower().startswith("added buttons")):
-            labels = _summarize_buttons(candidate.get("components"))
-            if labels:
-                reply = f"Added buttons: {labels}. Anything else to add?"
+        # Remove hardcoded button confirmations - let msgs_applied handle it
+        # No dynamic button/header summaries needed since msgs_applied provides exact details
 
-        if _has_component(candidate, "HEADER") and "header" in reply.lower():
-            hdr = _summarize_header(candidate.get("components"))
-            if hdr:
-                reply = f"Added header ({hdr}). Anything else to add?"
-
-        if _has_component(candidate, "FOOTER") and "footer" in reply.lower():
-            reply = "Added footer. Anything else to add?"
-
-        # Trim tone (no excessive enthusiasm in concise mode)
-        if _get_cfg_tone(cfg) == "concise":
+        # Trim tone (remove excessive enthusiasm unless friendly mode enabled)
+        if tone == "neutral" or not enc_enabled:
             reply = re.sub(r"\s*(?:Great progress!|Looking good!|Perfect!|Excellent!|Nice work!|Fantastic!|You're doing great!|This is looking really professional!|You're creating something.*?appreciate!|.*?beautifully!|.*?\u2728)", "", reply).strip()
 
         return await _persist_turn_and_return(reply, candidate, missing)
@@ -1115,7 +1171,9 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
             d.draft = merge_deep(draft, candidate)
             s.last_action = "ASK"
             final_reply = (reply + ("\n\nPlease fix: " + "; ".join(issues) if issues else "")).strip() or "Please address the validation issues."
-            if _get_cfg_tone(cfg) == "concise":
+            ui_cfg = (cfg.get("ui") or {})
+            tone = (ui_cfg.get("tone") or "neutral").lower()
+            if tone == "neutral":
                 final_reply = re.sub(r"\s*(Great progress!|Looking good!|Perfect!|Excellent!|Nice work!|Fantastic!).*$", "", final_reply)
             s.data = {**(s.data or {}), "messages": _append_history(inp.message, final_reply)}
             await touch_user_session(db, inp.user_id, s.id)
@@ -1128,7 +1186,9 @@ async def chat(inp: ChatInput, db: AsyncSession = Depends(get_db)):
         d.draft = candidate
         s.last_action = "FINAL"
         done_msg = reply or "Finalized."
-        if _get_cfg_tone(cfg) == "concise":
+        ui_cfg = (cfg.get("ui") or {})
+        tone = (ui_cfg.get("tone") or "neutral").lower()
+        if tone == "neutral":
             done_msg = done_msg.replace("Awesome!", "").strip()
         s.data = {**(s.data or {}), "messages": _append_history(inp.message, done_msg)}
         await touch_user_session(db, inp.user_id, s.id)
