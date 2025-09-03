@@ -490,7 +490,8 @@ def _summarize_header(components: list[dict]) -> str:
         if (c.get("type") or "").upper() == "HEADER":
             fmt = (c.get("format") or "").upper()
             if fmt == "TEXT":
-                return f'TEXT: "{(c.get("text") or '')[:60]}"'
+                text_val = (c.get("text") or "")[:60]
+                return f'TEXT: "{text_val}"'
             return fmt
     return ""
 
