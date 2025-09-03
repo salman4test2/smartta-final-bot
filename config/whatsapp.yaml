@@ -3,16 +3,20 @@ temperature: 0.2
 
 # UI tone and encouragement settings
 ui:
-  tone: neutral  # Can be: neutral, encouraging, professional
+  tone: encouraging  # Can be: neutral, encouraging, professional
   encouragement:
-    enabled: false
+    enabled: true
     phrases: 
       - "Great choice!"
       - "Excellent!"
       - "Perfect!"
       - "Well done!"
+      - "Wonderful!"
+      - "That sounds fantastic!"
+      - "Amazing!"
+      - "Love it!"
   confirmations:
-    style: neutral  # neutral, enthusiastic, minimal
+    style: enthusiastic  # neutral, enthusiastic, minimal
     neutral_phrases:
       - "Updated."
       - "Done."
