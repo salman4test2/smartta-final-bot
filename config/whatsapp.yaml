@@ -1,6 +1,37 @@
 model: gpt-4o-mini
 temperature: 0.2
 
+# UI tone and encouragement settings
+ui:
+  tone: neutral  # Can be: neutral, encouraging, professional
+  encouragement:
+    enabled: false
+    phrases: 
+      - "Great choice!"
+      - "Excellent!"
+      - "Perfect!"
+      - "Well done!"
+  confirmations:
+    style: neutral  # neutral, enthusiastic, minimal
+    neutral_phrases:
+      - "Updated."
+      - "Done."
+      - "Applied."
+      - "Changed."
+      - "Modified."
+
+# Text processing limits and settings
+text:
+  limits:
+    body_max_chars: 1024
+    header_max_chars: 60
+    footer_max_chars: 60
+    template_name_max_chars: 64
+  shorten:
+    enabled: true
+    target_length: 140
+    aggressive_mode: false
+
 # NLP configuration for intent parsing and synonyms
 nlp:
   synonyms:
@@ -14,18 +45,64 @@ nlp:
     shorten: ["shorten","shorter","make it short","condense","trim","crisper","concise","brief","reduce"]
     name: ["name","title","template name"]
     body: ["body","message","text","content","copy"]
+    remove: ["remove","delete","drop","clear","eliminate","take out"]
+    replace: ["replace","change","swap","substitute","update"]
+    modify: ["modify","edit","adjust","tweak","alter"]
   languages: ["en","hi","es"]
+  parsing:
+    case_sensitive: false
+    extract_quotes: true     # extract quoted text as raw labels
+    word_to_number: true     # convert "three" to "3"
+    max_extracted_items: 20  # safety limit for bulk operations
+  directive_processing:
+    enabled: true
+    strict_mode: true        # enforce exact counts and limits
+    allow_overrides: false   # prevent exceeding hard limits
+    preserve_order: true     # maintain user-specified order
 
 history:
   max_turns: 200
   log_llm_io: true  # your code logs regardless; this is just a hint
 
+# Validation and compliance settings
+validation:
+  phone_numbers:
+    normalize: true           # normalize phone format
+    require_country_code: true
+    allowed_formats: ["+1XXXXXXXXXX", "+91XXXXXXXXXX"]
+  urls:
+    validate_https: true      # prefer HTTPS URLs
+    check_reachability: false # ping test (expensive)
+    max_length: 512
+  meta_compliance:
+    enforce_guidelines: true  # follow Meta's template guidelines
+    check_prohibited_content: true
+    validate_button_limits: true
+  template_quality:
+    min_score: 0.7           # quality threshold (0-1)
+    check_readability: true
+    check_engagement: true
+
 limits:
   buttons:
-    max_total: 10      # overall hard cap
-    max_visible: 3     # on-card; rest under "See all"
-    max_url: 2
-    max_phone: 1
+    max_total: 10      # overall hard cap across all types
+    max_visible: 3     # visible on-card; rest under "See all"
+    max_url: 2         # URL button limit
+    max_phone: 1       # phone number button limit
+    max_quick_reply: 10  # quick reply button limit
+    deduplication: true  # remove duplicate button labels
+    enforce_counts: true # strictly enforce count directives
+  text:
+    body_max_chars: 1024
+    header_max_chars: 60
+    footer_max_chars: 60
+    min_body_chars: 10   # minimum body text length
+  template:
+    name_max_chars: 64
+    name_pattern: "^[a-z0-9_]{1,64}$"
+  processing:
+    max_iterations: 5    # max rounds of directive processing
+    timeout_seconds: 30  # max processing time per request
 
 creation_payload_schema:
   $schema: "http://json-schema.org/draft-07/schema#"
@@ -112,10 +189,11 @@ creation_payload_schema:
                       - properties: { format: { enum: [IMAGE, VIDEO, DOCUMENT, LOCATION] } }
 
 lint_rules:
-  # Lengths (Meta norms)
-  body_max_chars: 1024
-  header_text_max_chars: 60
-  footer_max_chars: 60
+  # Meta compliance validation
+  meta_guidelines:
+    enforce_character_limits: true
+    check_placeholder_rules: true
+    validate_category_restrictions: true
 
   # Placeholder hygiene
   placeholders:
@@ -123,11 +201,11 @@ lint_rules:
     forbid_adjacent: true         # no "{{1}}{{2}}"
     forbid_edge_positions: true   # not at very start or end of BODY
 
-  # Button constraints (mirrors limits.buttons)
+  # Button constraints (inherits from limits.buttons)
   buttons:
-    max_total: 10
-    max_url: 2
-    max_phone: 1
+    use_global_limits: true      # inherit from limits.buttons section
+    validate_duplicates: true
+    enforce_type_limits: true
 
   # Language and naming constraints
   languages:
@@ -170,17 +248,27 @@ lint_rules:
       require_example: false  # Optional for LOCATION
       forbid_text: true
 
-  # Components configuration (future-proof header config block)
+  # Components configuration for enhanced directive processing
   components:
     buttons:
       defaults_by_category:
         MARKETING: ["Shop now", "Learn more", "Contact us"]
         UTILITY: ["View details", "Update info", "Get help"]
         AUTHENTICATION: []  # buttons not allowed anyway
+      smart_suggestions: true    # suggest contextual buttons
+      auto_deduplication: true   # remove duplicates automatically
+      preserve_user_order: true  # maintain user-specified order
     text:
       shorten:
         enabled: true
         target_length: 140
+        preserve_key_info: true   # keep important details
+        use_ai_summary: true      # use LLM for intelligent shortening
+    processing:
+      directive_modes:
+        strict: true              # enforce exact counts
+        permissive: false         # allow approximations
+        interactive: true         # ask for clarification when ambiguous
     header:
       formats:
         TEXT:
