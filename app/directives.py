@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Dict, Any, List, Tuple
 import re
 
-URL_RE   = re.compile(r"(https?://[^\s]+)", re.I)
+URL_RE   = re.compile(r"(https?://[^\s]+|www\.[^\s]+\.[^\s]+|[^\s]+\.[^\s]*\.com[^\s]*)", re.I)
 PHONE_RE = re.compile(r"(\+?[\d\-\s().]{10,})", re.I)
 
 def _tok(s: str) -> List[str]:
@@ -93,8 +93,15 @@ def parse_directives(cfg: Dict[str, Any], text: str) -> List[dict]:
             pass
 
         if url:
+            url_text = url.group(0)
+            # Ensure URL has protocol
+            if not url_text.startswith(('http://', 'https://')):
+                if url_text.startswith('www.'):
+                    url_text = 'https://' + url_text
+                else:
+                    url_text = 'https://' + url_text
             directives.append({"type": "buttons.set", "mode": "replace", "buttons": [
-                {"type": "URL", "text": labels[0] if labels else "Visit", "url": url.group(0)}
+                {"type": "URL", "text": labels[0] if labels else "Visit Website", "url": url_text}
             ]})
         elif phone:
             directives.append({"type": "buttons.set", "mode": "replace", "buttons": [
@@ -126,9 +133,19 @@ def parse_directives(cfg: Dict[str, Any], text: str) -> List[dict]:
 
     # set body
     if any(x in toks for x in syn_body):
-        q = re.search(r'(?:body|message|text|content)\s*(?:is|=|:)\s*["\'](.+?)["\']', text, re.I | re.S)
-        if q:
-            directives.append({"type": "body.set", "text": q.group(1).strip()})
+        # Try multiple patterns for body content extraction
+        patterns = [
+            r'(?:body|message|text|content)\s*(?:is|=|:)\s*["\'](.+?)["\']',  # Original quoted pattern
+            r'(?:message|text)\s+(?:should\s+)?(?:say|be|read):\s*(.+?)(?=\s+and\s+add\s+|\s+and\s+button|\s*$)',  # "message should say: content"
+            r'(?:body|message|text|content)\s*(?:is|=|:)\s*(.+?)(?=\s+and\s+|\s*$)',  # Unquoted until "and" or end
+        ]
+        for pattern in patterns:
+            q = re.search(pattern, text, re.I | re.S)
+            if q:
+                content = q.group(1).strip().strip('\'"')  # Remove quotes if present
+                if content:  # Only add if not empty
+                    directives.append({"type": "body.set", "text": content})
+                    break
 
     # header/footer simple text set
     if any(x in toks for x in syn_header):
@@ -197,13 +214,14 @@ def apply_directives(cfg: Dict[str, Any], directives: List[dict],
                 labels = _dedup_labels([str(x)[:25] for x in labels])
                 btns = [{"type": "QUICK_REPLY", "text": lab} for lab in labels]
                 set_buttons(btns, replace=(mode=="replace"))
-                msgs.append(f"Set {len(btns)} quick reply button(s) ({' / '.join(labels)}).")
+                # Let LLM handle friendly acknowledgment
+                pass
             # URL/PHONE already normalized in parse_directives
             elif d.get("buttons"):
                 btns = d["buttons"]
                 set_buttons(btns, replace=(mode=="replace"))
-                lab = " / ".join([b.get("text","").strip() for b in btns if b.get("text")])
-                msgs.append(f"Set {len(btns)} button(s) ({lab}).")
+                # Don't generate technical messages - let LLM handle friendly responses
+                pass
             else:
                 # No labels provided → pick defaults by category/business
                 defaults = _defaults_by_category(cfg, cat) or ["Shop now"]
@@ -213,7 +231,8 @@ def apply_directives(cfg: Dict[str, Any], directives: List[dict],
                 labels = defaults[: max(1, min(max_visible, int(count)))]
                 btns = [{"type": "QUICK_REPLY", "text": lab} for lab in labels]
                 set_buttons(btns, replace=(mode=="replace"))
-                msgs.append(f"Set {len(btns)} quick reply button(s) ({' / '.join(labels)}).")
+                # Let LLM provide friendly acknowledgment
+                pass
 
             out["components"] = comps
 
